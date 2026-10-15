@@ -166,7 +166,21 @@ AssignmentExplanation = {
 | DELETE | `/missions/{id}` | only terminal missions |
 
 Dispatcher configuration: GET/PUT `/settings/dispatcher` →
-`{"weights":{"distance","travelTime","battery","congestion","queue"},"minBatteryPct","reserveBatteryPct","lookaheadSegments"}`.
+`{"mode": "central"|"colony", "weights":{"distance","travelTime","battery","congestion","queue"},"minBatteryPct","reserveBatteryPct","lookaheadSegments"}`.
+`mode: "colony"` switches to the ant-colony allocation: open missions are published on the shared board and the
+autonomous on-board agents claim them (see `docs/colony.md`); the weights are then only used for the central
+eligibility check.
+
+## Colony board
+
+GET `/colony/board?siteId=` →
+```
+{"mode": "central"|"colony",
+ "tasks": [{"id","type","origin","destination","nodes":[],"priority","urgency","massKg","loadPresent","requiredModelId","createdAt"}],
+ "agents": [{"vehicleId","battery","node","assignment":{"taskId","status":"idle"|"assigned"|"executing"},"claims","wins",
+             "decisions":[{"taskId","cost","urgency","delayS","reason","ok"}]}],   // in-process agents (simulated vehicles)
+ "stats": {"granted","rejected","recent":[{"claimId","taskId","vehicleId","granted","reason","competing"}]}}
+```
 
 ## Traffic
 

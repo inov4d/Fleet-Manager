@@ -152,6 +152,10 @@ func (c *Core) DeleteVehicle(id string) error {
 	c.gw.Unregister(id)
 	c.traffic.Remove(id)
 	c.analytics.Forget(id)
+	if ag := c.agents[id]; ag != nil {
+		ag.Stop()
+		delete(c.agents, id)
+	}
 	if c.simEngine.Agent(id) != nil {
 		c.simEngine.Remove(id)
 	}

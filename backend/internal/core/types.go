@@ -683,7 +683,19 @@ type Webhook struct {
 // ---------------------------------------------------------------------------
 // Settings
 
+// AllocationMode selects who decides task assignment.
+type AllocationMode string
+
+const (
+	// AllocationCentral: the fleet manager's dispatcher scores and assigns.
+	AllocationCentral AllocationMode = "central"
+	// AllocationColony: autonomous on-board agents claim tasks from the shared
+	// board (ant colony); the fleet manager only arbitrates and verifies.
+	AllocationColony AllocationMode = "colony"
+)
+
 type DispatcherSettings struct {
+	Mode              AllocationMode     `json:"mode"`
 	Weights           map[string]float64 `json:"weights"`
 	MinBatteryPct     float64            `json:"minBatteryPct"`
 	ReserveBatteryPct float64            `json:"reserveBatteryPct"`
@@ -692,6 +704,7 @@ type DispatcherSettings struct {
 
 func DefaultDispatcherSettings() DispatcherSettings {
 	return DispatcherSettings{
+		Mode:              AllocationCentral,
 		Weights:           map[string]float64{"distance": 1.0, "travelTime": 1.0, "battery": 0.5, "congestion": 0.7, "queue": 1.0},
 		MinBatteryPct:     20,
 		ReserveBatteryPct: 10,

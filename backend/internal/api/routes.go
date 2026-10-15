@@ -483,6 +483,15 @@ func (s *Server) routes() {
 		writeJSON(w, 200, s.core.SetScenario(b))
 	}))
 
+	// colony (ant-colony task allocation)
+	m.HandleFunc("GET "+v1+"/colony/board", s.guard(auth.PermRead, func(w http.ResponseWriter, r *http.Request) {
+		site := q(r, "siteId")
+		if site == "" {
+			site = core.DefaultSiteID
+		}
+		writeJSON(w, 200, s.core.Colony(site))
+	}))
+
 	// users / keys / audit / system
 	m.HandleFunc("GET "+v1+"/users", s.guard(auth.PermUsers, func(w http.ResponseWriter, r *http.Request) {
 		us, _ := s.core.Store().ListUsers(r.Context())

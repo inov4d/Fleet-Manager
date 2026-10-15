@@ -6,6 +6,7 @@ import { useAuthStore } from "@/stores/auth";
 import { PageHeader, Spinner } from "@/components/ui/card";
 import { Tabs } from "@/components/ui/tabs";
 import { BatterySettingsForm, DispatcherSettingsForm, TrafficSettingsForm } from "@/components/settings/settings-forms";
+import { ColonyPanel } from "@/components/settings/colony-panel";
 import { SitesAdmin } from "@/components/settings/sites-admin";
 import { UsersAdmin } from "@/components/settings/users-admin";
 import { ApiKeysAdmin } from "@/components/settings/api-keys-admin";
@@ -63,7 +64,12 @@ function SettingsTabs() {
     <div className="flex flex-col gap-3">
       <PageHeader title="Paramètres" subtitle={def?.edit && !canEdit ? "Lecture seule pour votre rôle" : undefined} />
       <Tabs<TabKey> tabs={visible.map((t) => ({ key: t.key, label: t.label }))} value={tab} onChange={change} />
-      {tab === "dispatcher" && <DispatcherSettingsForm canEdit={canEdit} />}
+      {tab === "dispatcher" && (
+        <div className="flex flex-col gap-4">
+          <DispatcherSettingsForm canEdit={canEdit} />
+          <ColonyPanel />
+        </div>
+      )}
       {tab === "battery" && <BatterySettingsForm canEdit={canEdit} />}
       {tab === "traffic" && <TrafficSettingsForm canEdit={canEdit} />}
       {tab === "sites" && <SitesAdmin />}

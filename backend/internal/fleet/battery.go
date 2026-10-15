@@ -68,6 +68,9 @@ func (c *Core) batteryManagement(now time.Time) {
 			continue
 		}
 		idle := now.Sub(r.idleSince)
+		if c.dispatch.Mode == core.AllocationColony && r.state.BatteryCharge > c.battery.CriticalPct {
+			continue // the agents decide for themselves; the centre keeps only the critical safety net
+		}
 		switch {
 		case r.state.BatteryCharge <= c.battery.CriticalPct:
 			_, _ = c.createChargeMission(v, r, 9, "battery manager (critical)")
@@ -82,8 +85,8 @@ func (c *Core) batteryManagement(now time.Time) {
 }
 
 func (c *Core) hasQueuedMission(vehicleID string) bool {
-	for mid, vid := range c.pins {
-		if vid == vehicleID {
+	for mid, p := range c.pins {
+		if p.vehicleID == vehicleID {
 			if m, err := c.missions.Get(mid); err == nil && !m.Status.Terminal() {
 				return true
 			}
@@ -149,7 +152,7 @@ func (c *Core) createParkMission(v *core.Vehicle, r *vehicleRuntime) {
 	for _, m := range c.missions.List(v.SiteID, "", "", 0, true) {
 		if m.Type == core.MissionReturnToStation {
 			held[m.Destination] = true
-			if m.VehicleID == v.ID || c.pins[m.ID] == v.ID {
+			if m.VehicleID == v.ID || c.pins[m.ID].vehicleID == v.ID {
 				return
 			}
 		}

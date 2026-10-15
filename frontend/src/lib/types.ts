@@ -411,7 +411,10 @@ export interface MissionListQuery {
   limit?: number;
 }
 
+export type AllocationMode = "central" | "colony";
+
 export interface DispatcherSettings {
+  mode: AllocationMode;
   weights: {
     distance: number;
     travelTime: number;
@@ -678,4 +681,55 @@ export type WsMessage =
 export interface StoredEvent extends FleetEvent {
   id: number;
   ts: string;
+}
+
+/* Colony (ant-colony task allocation) */
+
+export interface ColonyTask {
+  id: string;
+  type: string;
+  origin: string;
+  destination: string;
+  nodes: string[];
+  priority: number;
+  urgency: number;
+  massKg: number;
+  loadPresent: boolean;
+  requiredModelId: string;
+  createdAt: string;
+}
+
+export interface ColonyDecision {
+  taskId: string;
+  cost: number;
+  urgency: number;
+  delayS: number;
+  reason: string;
+  ok: boolean;
+}
+
+export interface ColonyAgent {
+  vehicleId: string;
+  battery: number;
+  node: string;
+  assignment: { vehicleId: string; taskId: string; status: "idle" | "assigned" | "executing" | ""; ts: string };
+  claims: number;
+  wins: number;
+  decisions: ColonyDecision[];
+}
+
+export interface ColonyGrant {
+  claimId: string;
+  taskId: string;
+  vehicleId: string;
+  granted: boolean;
+  reason: string;
+  competing: number;
+}
+
+export interface ColonyStatus {
+  mode: AllocationMode;
+  tasks: ColonyTask[];
+  agents: ColonyAgent[];
+  stats: { granted: number; rejected: number; recent: ColonyGrant[] };
 }

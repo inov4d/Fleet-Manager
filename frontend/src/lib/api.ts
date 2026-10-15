@@ -41,6 +41,7 @@ import type {
   VehicleWithState,
   FaultType,
   ScenarioName,
+  ColonyStatus,
 } from "@/lib/types";
 
 export class ApiError extends Error {
@@ -208,6 +209,7 @@ export const api = {
   },
 
   settings: {
+    getColony: (siteId: string) => get<ColonyStatus>(`/colony/board?siteId=${encodeURIComponent(siteId)}`),
     getDispatcher: () => get<DispatcherSettings>("/settings/dispatcher"),
     putDispatcher: (s: DispatcherSettings) => put<DispatcherSettings>("/settings/dispatcher", s),
     getTraffic: () => get<TrafficSettings>("/settings/traffic"),

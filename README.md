@@ -32,6 +32,9 @@ Ou tout-en-un : `cp deploy/.env.example deploy/.env && make up` puis http://loca
 - **Attribution automatique explicable** (distance, temps, batterie, congestion, file,
   capacité, compatibilité géométrique, modèle requis) et réaffectation contrôlée (jamais
   automatique si une charge peut être à bord).
+- **Mode colonie (fourmilière)** : tableau de tâches partagé et agent autonome open source
+  embarqué sur chaque AGV (`agvagent`) qui revendique la tâche la plus opportune selon ses
+  règles locales ; le centre arbitre et vérifie seulement ([docs/colony.md](docs/colony.md)).
 - **Gestion du trafic** : réservations nœud/arête/zone, enveloppes balayées des manœuvres
   omnidirectionnelles (charge, débordement, marges, incertitude de localisation), couloirs
   à sens unique, croisements, zones d'attente, détection de blocages et d'**interblocages**
@@ -52,7 +55,7 @@ Ou tout-en-un : `cp deploy/.env.example deploy/.env && make up` puis http://loca
 ## Documentation
 
 - [Architecture](docs/architecture.md) · [Trafic et réservations](docs/traffic.md)
-- [VDA 5050](docs/vda5050.md) · [Intégration industrielle](docs/integration.md)
+- [VDA 5050](docs/vda5050.md) · [Intégration industrielle](docs/integration.md) · [Mode colonie](docs/colony.md)
 - [API](docs/api.md) · [Sécurité](docs/security.md) · [Déploiement](docs/deployment.md)
 - [Phases et feuille de route](docs/roadmap.md)
 
@@ -66,7 +69,7 @@ cd frontend && npm run lint && npm run build
 ## Structure
 
 ```
-backend/   fleetd (Go) : cmd/fleetd, internal/{core,geometry,mapmgr,planner,traffic,vda5050,transport,gateway,sim,mission,alarm,maintenance,analytics,auth,audit,store,fleet,api,integration,config}
+backend/   fleetd + agvagent (Go) : cmd/{fleetd,agvagent}, internal/{core,geometry,mapmgr,planner,traffic,vda5050,transport,gateway,sim,mission,colony,alarm,maintenance,analytics,auth,audit,store,fleet,api,integration,config}
 frontend/  Next.js 15 / React 19 / Tailwind / PixiJS / recharts / three
 deploy/    docker-compose.yml, .env.example
 docs/      documentation technique

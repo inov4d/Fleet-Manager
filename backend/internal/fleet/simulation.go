@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/inov4d/fleet-manager/internal/colony"
 	"github.com/inov4d/fleet-manager/internal/core"
 	"github.com/inov4d/fleet-manager/internal/geometry"
 	"github.com/inov4d/fleet-manager/internal/mapmgr"
@@ -257,6 +258,15 @@ func (c *Core) spawnSimVehicle(siteID, modelID, nodeID string) (*core.VehicleWit
 	if _, err := c.simEngine.Spawn(cfg); err != nil {
 		return nil, err
 	}
+	// every simulated vehicle carries the open-source on-board agent, exactly
+	// like a real AGV would; it only finds tasks on the board in colony mode
+	ag := colony.NewAgent(colony.AgentConfig{SiteID: siteID, VehicleID: v.ID, Manufacturer: v.Manufacturer, Serial: serial, Interface: c.cfg.VDAInterface,
+		LowBatteryPct: c.battery.LowPct, CriticalBatteryPct: c.battery.CriticalPct}, c.tr, c.log)
+	if err := ag.Start(); err != nil {
+		c.log.Warn("colony agent start failed", "vehicle", v.ID, "err", err)
+	} else {
+		c.agents[v.ID] = ag
+	}
 	return &core.VehicleWithState{Vehicle: v, State: c.rt[v.ID].state}, nil
 }
 
@@ -267,6 +277,10 @@ func (c *Core) StopSimulation() SimulationStatus {
 	ids := c.simEngine.VehicleIDs()
 	c.simEngine.Stop()
 	for _, id := range ids {
+		if ag := c.agents[id]; ag != nil {
+			ag.Stop()
+			delete(c.agents, id)
+		}
 		if ex := c.execs[id]; ex != nil {
 			_, _ = c.missions.Cancel(ex.missionID, "simulation stopped")
 			delete(c.execs, id)

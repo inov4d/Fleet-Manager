@@ -291,33 +291,42 @@ func (c *Core) dispatchMissions() {
 			continue
 		}
 		cands := c.candidates(sid, pending)
-		// pinned missions (charging, parking, manual moves, operator reassignment) first
+		// pinned missions (charging, parking, manual moves, operator reassignment,
+		// colony grants) first
 		var free []core.Mission
 		taken := map[string]bool{}
+		now := c.clock.Now()
 		for _, m := range pending {
-			vid, pinned := c.pins[m.ID]
+			p, pinned := c.pins[m.ID]
 			if !pinned {
 				free = append(free, m)
 				continue
 			}
+			if c.vehicles[p.vehicleID] == nil || (!p.at.IsZero() && now.Sub(p.at) > 15*time.Second) {
+				delete(c.pins, m.ID) // vehicle gone or pin stale: open the mission again
+				continue
+			}
 			var only []mission.CandidateCtx
 			for _, cc := range cands {
-				if cc.VehicleID == vid {
+				if cc.VehicleID == p.vehicleID {
 					only = append(only, cc)
 				}
 			}
 			if len(only) == 0 {
-				if c.vehicles[vid] == nil {
-					delete(c.pins, m.ID) // vehicle gone: open the mission to the fleet
-				}
 				continue
 			}
 			for _, d := range mission.Dispatch([]core.Mission{m}, only, c.dispatch) {
+				if p.explanation != nil {
+					d.Explanation = *p.explanation
+				}
 				if c.startExecution(d) {
 					taken[d.VehicleID] = true
 					delete(c.pins, m.ID)
 				}
 			}
+		}
+		if c.dispatch.Mode == core.AllocationColony {
+			continue // free tasks stay on the board: the agents claim them
 		}
 		var rest []mission.CandidateCtx
 		for _, cc := range cands {
@@ -333,8 +342,8 @@ func (c *Core) dispatchMissions() {
 
 // pinnedVehicle reports whether a vehicle is reserved by a pending pinned mission.
 func (c *Core) pinnedVehicle(vehicleID string) bool {
-	for mid, vid := range c.pins {
-		if vid == vehicleID {
+	for mid, p := range c.pins {
+		if p.vehicleID == vehicleID {
 			if m, err := c.missions.Get(mid); err == nil && m.Status == core.MissionPending {
 				return true
 			}
@@ -1009,10 +1018,21 @@ func (c *Core) ReassignMission(id, vehicleID string, confirmLoad bool, by string
 	return m, err
 }
 
+// pin is a forced assignment awaiting dispatch.
+type pin struct {
+	vehicleID   string
+	explanation *core.AssignmentExplanation
+	at          time.Time
+}
+
 // pinned forces the next dispatch of a mission to one vehicle.
 func (c *Core) pinned(missionID, vehicleID string) {
+	c.pinWith(missionID, vehicleID, nil)
+}
+
+func (c *Core) pinWith(missionID, vehicleID string, expl *core.AssignmentExplanation) {
 	if c.pins == nil {
-		c.pins = map[string]string{}
+		c.pins = map[string]pin{}
 	}
-	c.pins[missionID] = vehicleID
+	c.pins[missionID] = pin{vehicleID: vehicleID, explanation: expl, at: c.clock.Now()}
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/inov4d/fleet-manager/internal/alarm"
 	"github.com/inov4d/fleet-manager/internal/analytics"
+	"github.com/inov4d/fleet-manager/internal/colony"
 	"github.com/inov4d/fleet-manager/internal/core"
 	"github.com/inov4d/fleet-manager/internal/gateway"
 	"github.com/inov4d/fleet-manager/internal/geometry"
@@ -104,7 +105,9 @@ type Core struct {
 	simState simulationState
 	whMu     sync.RWMutex
 	webhooks []core.Webhook
-	pins     map[string]string // mission id -> vehicle id forced assignment
+	pins     map[string]pin // mission id -> forced assignment
+	board    *colony.BoardServer
+	agents   map[string]*colony.Agent // in-process agents of simulated vehicles
 
 	subsMu       sync.Mutex
 	subs         map[int]func(core.Event)
@@ -155,6 +158,11 @@ func New(cfg Config, d Deps) (*Core, error) {
 	c.traffic.SetSettings(ts)
 	c.dispatch = core.DefaultDispatcherSettings()
 	_, _ = d.Store.GetSetting(context.Background(), "dispatcher", &c.dispatch)
+	if c.dispatch.Mode == "" {
+		c.dispatch.Mode = core.AllocationCentral
+	}
+	c.agents = map[string]*colony.Agent{}
+	c.board = colony.NewBoardServer(d.Transport, (*arbiter)(c), d.Logger, 300*time.Millisecond)
 	c.battery = core.DefaultBatterySettings()
 	_, _ = d.Store.GetSetting(context.Background(), "battery", &c.battery)
 	if err := c.load(); err != nil {
@@ -260,6 +268,13 @@ func (c *Core) Start() error {
 	if err := c.gw.Start(c.onVehicleState, c.onVehicleConnection); err != nil {
 		return err
 	}
+	sites := make([]string, 0, len(c.sites))
+	for id := range c.sites {
+		sites = append(sites, id)
+	}
+	if err := c.board.Start(sites, 300*time.Millisecond); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	c.running = true
 	c.stop = make(chan struct{})
@@ -301,6 +316,13 @@ func (c *Core) Stop() {
 	close(c.stop)
 	c.mu.Unlock()
 	c.wg.Wait()
+	c.board.Stop()
+	c.mu.Lock()
+	for _, a := range c.agents {
+		a.Stop()
+	}
+	c.agents = map[string]*colony.Agent{}
+	c.mu.Unlock()
 	c.simEngine.Stop()
 	c.gw.Stop()
 	c.persistCounters(true)
@@ -819,6 +841,7 @@ func (c *Core) SaveSite(s core.Site) (*core.Site, error) {
 		return nil, err
 	}
 	c.sites[s.ID] = &s
+	c.board.AddSite(s.ID)
 	return &s, nil
 }
 
@@ -872,6 +895,13 @@ func (c *Core) DispatcherSettings() core.DispatcherSettings {
 func (c *Core) SetDispatcherSettings(s core.DispatcherSettings) error {
 	if s.Weights == nil {
 		s.Weights = core.DefaultDispatcherSettings().Weights
+	}
+	switch s.Mode {
+	case "":
+		s.Mode = core.AllocationCentral
+	case core.AllocationCentral, core.AllocationColony:
+	default:
+		return core.Validation("mode must be central or colony")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()

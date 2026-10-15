@@ -3,6 +3,7 @@ package fleet
 import (
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -176,5 +177,66 @@ func TestCommsLossSuspendsAndProtects(t *testing.T) {
 	}
 	if len(c.Alarms().Active("")) != 0 {
 		t.Fatalf("alarms should be cleared: %+v", c.Alarms().Active(""))
+	}
+}
+
+func TestColonyModeClaimsAndCompletes(t *testing.T) {
+	c := newCore(t)
+	ds := c.DispatcherSettings()
+	ds.Mode = core.AllocationColony
+	if err := c.SetDispatcherSettings(ds); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Stop()
+	if _, err := c.StartSimulation(SimulationStart{Vehicles: 3, TimeScale: 20, ModelMix: map[string]float64{"AGV20T": 1}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "vehicles available", func() bool {
+		n := 0
+		for _, v := range c.Vehicles("") {
+			if v.State.Availability == core.AvailAvailable {
+				n++
+			}
+		}
+		return n == 3
+	})
+	m1, err := c.CreateMission(core.Mission{Origin: "PICK1", Destination: "DROP3", Load: core.MissionLoad{Present: true, MassKg: 8000}, Priority: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, err := c.CreateMission(core.Mission{Origin: "PICK6", Destination: "DROP5", Load: core.MissionLoad{Present: true, MassKg: 5000}, Priority: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "board shows the tasks", func() bool { return len(c.Colony("").Tasks) == 2 })
+	waitFor(t, 15*time.Second, "both tasks claimed by different agents", func() bool {
+		a, _ := c.Missions().Get(m1.ID)
+		b, _ := c.Missions().Get(m2.ID)
+		return a.VehicleID != "" && b.VehicleID != "" && a.VehicleID != b.VehicleID
+	})
+	a, _ := c.Missions().Get(m1.ID)
+	if a.Assignment == nil || a.Assignment.ChosenVehicleID != a.VehicleID || len(a.Assignment.Candidates) == 0 {
+		t.Fatalf("claim explanation missing: %+v", a.Assignment)
+	}
+	found := false
+	for _, h := range a.History {
+		if strings.Contains(h.Message, "claimed by") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("history should record the claim: %+v", a.History)
+	}
+	waitFor(t, 120*time.Second, "missions completed by the colony", func() bool {
+		x, _ := c.Missions().Get(m1.ID)
+		y, _ := c.Missions().Get(m2.ID)
+		return x.Status == core.MissionCompleted && y.Status == core.MissionCompleted
+	})
+	st := c.Colony("")
+	if st.Mode != core.AllocationColony || len(st.Agents) != 3 || st.Stats.Granted < 2 {
+		t.Fatalf("colony status %+v", st.Stats)
 	}
 }

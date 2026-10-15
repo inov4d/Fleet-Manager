@@ -40,7 +40,8 @@ par MQTT).
 | `transport` | — | Bus mémoire, client MQTT (Paho), broker embarqué (Mochi) |
 | `gateway` | Vehicle Communication Gateway | Enregistrement des véhicules, heartbeat, doublons, envoi d'ordres / instant actions, construction d'ordres (base libérée / horizon) |
 | `sim` | Simulation Engine | AGV simulés parlant VDA 5050 (cinématique omnidirectionnelle 4 bogies, batterie, actions, pannes) |
-| `mission` | Mission Manager + Task Scheduler | Cycle de vie des missions, dépendances, réaffectation contrôlée, moteur d'attribution explicable |
+| `mission` | Mission Manager + Task Scheduler | Cycle de vie des missions, dépendances, réaffectation contrôlée, moteur d'attribution explicable (mode central) |
+| `colony` | Task Scheduler décentralisé | Tableau de tâches partagé, arbitrage des revendications, agent embarqué open source (`cmd/agvagent`) — mode colonie, voir `docs/colony.md` |
 | `battery` (dans `fleet`) | Battery + Charging Manager | Seuils, recharge d'opportunité, choix de station, retour en station |
 | `alarm` | Alarm Manager | Alarmes dédupliquées, acquittement, historique |
 | `maintenance` | Maintenance Manager | Plans par compteur (km, heures, missions, calendrier), statuts, interventions |

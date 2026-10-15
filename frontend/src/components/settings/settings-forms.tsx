@@ -6,7 +6,7 @@ import { useApi } from "@/hooks/use-api";
 import { toast } from "@/stores/ui";
 import { Card, CardHeader, CardBody, ErrorBox, Spinner } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Field, Input, Slider } from "@/components/ui/input";
+import { Field, Input, Select, Slider } from "@/components/ui/input";
 
 /** Generic settings form shell: loads with `load`, saves with `save`. */
 function useSettingsForm<T>(load: () => Promise<T>, save: (v: T) => Promise<T>) {
@@ -46,8 +46,22 @@ export function DispatcherSettingsForm({ canEdit }: { canEdit: boolean }) {
   ];
   return (
     <Card>
-      <CardHeader title="Répartiteur" subtitle="Pondération des critères d’affectation" />
+      <CardHeader title="Répartiteur" subtitle="Mode d’attribution et pondération des critères" />
       <CardBody className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="md:col-span-2">
+          <Field label="Mode d’attribution" htmlFor="d-mode" hint={v.mode === "colony" ? "Colonie : chaque AGV embarque un agent autonome qui choisit sa tâche sur le tableau partagé ; le centre arbitre les revendications simultanées et vérifie l’éligibilité." : "Central : le répartiteur du Fleet Manager note les candidats et affecte les missions."}>
+            <Select
+              id="d-mode"
+              value={v.mode ?? "central"}
+              onChange={(e) => f.setDraft({ ...v, mode: e.target.value as DispatcherSettings["mode"] })}
+              disabled={!canEdit}
+              options={[
+                { value: "central", label: "Central (répartiteur)" },
+                { value: "colony", label: "Colonie (agents autonomes, fourmilière)" },
+              ]}
+            />
+          </Field>
+        </div>
         <div className="flex flex-col gap-3">
           {W.map(([k, labelText]) => (
             <Field key={k} label={`${labelText} : ${v.weights[k]}`} htmlFor={`w-${k}`}>
