@@ -293,13 +293,15 @@ func (a *Agent) onOrder(_ string, payload []byte) {
 		a.dirty = true
 		return
 	}
-	// new order: accepted when idle, or when its first node is where we stand
-	if a.order != nil && a.nodeIdx < len(a.order.Nodes) && a.order.Nodes[a.nodeIdx].Released && a.driving {
-		// still executing a released base: the new order must start at the last node reached
-		if o.Nodes[0].NodeID != a.lastNodeID {
-			a.addError("orderUpdateError", "new order while executing base", vda5050.ErrorWarning)
-			return
-		}
+	// new order: accepted only when the AGV stands still at its last node and
+	// the order starts there (VDA 5050 6.6.3); otherwise orderUpdateError
+	if a.order != nil && (a.driving || a.running != nil) {
+		a.addError("orderUpdateError", "new order received while executing the current base", vda5050.ErrorWarning)
+		return
+	}
+	if a.lastNodeID != "" && o.Nodes[0].NodeID != a.lastNodeID {
+		a.addError("orderUpdateError", "new order does not start at the AGV's last node", vda5050.ErrorWarning)
+		return
 	}
 	a.order = &o
 	a.actionStates = a.actionStates[:0]
@@ -489,7 +491,8 @@ func (a *Agent) Step(dt float64) {
 			a.startNodeActions(a.nodeIdx - 1)
 		}
 	}
-	canMove := a.order != nil && a.running == nil && !a.paused && !a.blocked && a.eStop == vda5050.EStopNone && !a.hasFatal() && !a.charging
+	// a real controller stops on communication loss (risk analysis); so does the simulated one
+	canMove := a.order != nil && a.running == nil && !a.paused && !a.blocked && !a.commsLoss && a.eStop == vda5050.EStopNone && !a.hasFatal() && !a.charging
 	moved := false
 	if canMove && a.nodeIdx < len(a.order.Nodes) && a.order.Nodes[a.nodeIdx].Released {
 		moved = a.moveToward(dt)

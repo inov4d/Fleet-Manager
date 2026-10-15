@@ -355,11 +355,18 @@ func (c *Core) Tick() {
 		c.refreshDerived(v, r, now)
 		if g := c.graphs[v.SiteID]; g != nil && r.state.PositionInitialized {
 			node := c.currentNode(v, r, g.g)
-			prio := 0
-			if ex := c.execs[id]; ex != nil {
+			prio, ri := 0, -1
+			if ex := c.execs[id]; ex != nil && ex.routeIdx < len(ex.route) {
 				prio = ex.priority
+				// the route position reported by the vehicle (sequenceId) is
+				// authoritative while it follows its order; geometry only takes
+				// over when the vehicle clearly stands somewhere else
+				rn := g.g.Nodes[ex.route[ex.routeIdx]]
+				if rn != nil && (r.state.Driving || rn.Point().Dist(core.Point{X: r.state.Pose.X, Y: r.state.Pose.Y}) <= 3.0) {
+					node, ri = rn.ID, ex.routeIdx
+				}
 			}
-			c.traffic.Observe(traffic.VehicleCtx{ID: id, SiteID: v.SiteID, Pose: r.state.Pose, Envelope: r.state.LoadEnvelope, Priority: prio, CurrentNode: node, Connected: r.state.Connection == core.ConnOnline})
+			c.traffic.Observe(traffic.VehicleCtx{ID: id, SiteID: v.SiteID, Pose: r.state.Pose, Envelope: r.state.LoadEnvelope, Priority: prio, CurrentNode: node, Connected: r.state.Connection == core.ConnOnline, RouteIndex: ri})
 		}
 		c.vehicleAlarms(v, r)
 		c.analytics.Observe(id, c.execs[id] != nil, r.distanceDelta(), r.takeEnergy())
@@ -411,6 +418,10 @@ func (c *Core) refreshDerived(v *core.Vehicle, r *vehicleRuntime, now time.Time)
 	// odometer / hours from observed motion
 	if r.hasPose && r.state.Driving {
 		r.counters.OperatingHours += c.dtSeconds(r) / 3600
+	}
+	r.state.MissionID = ""
+	if ex := c.execs[v.ID]; ex != nil {
+		r.state.MissionID = ex.missionID
 	}
 	r.state.OdometerM = r.counters.OdometerM
 	r.state.OperatingHours = r.counters.OperatingHours

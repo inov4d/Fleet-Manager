@@ -33,7 +33,13 @@ func corridor() (*Manager, *mapmgr.Graph, *core.ManualClock) {
 
 func ctxAt(id string, g *mapmgr.Graph, node string, theta float64, prio int) VehicleCtx {
 	n := g.Nodes[node]
-	return VehicleCtx{ID: id, SiteID: "s", Pose: core.Pose{X: n.X, Y: n.Y, Theta: theta}, Envelope: env20, Priority: prio, CurrentNode: node, Connected: true}
+	return VehicleCtx{ID: id, SiteID: "s", Pose: core.Pose{X: n.X, Y: n.Y, Theta: theta}, Envelope: env20, Priority: prio, CurrentNode: node, Connected: true, RouteIndex: -1}
+}
+
+// req issues a request for a route starting at the vehicle's current node.
+func req(tm *Manager, v VehicleCtx, route []string) GrantResult {
+	v.RouteIndex = 0
+	return tm.Request(v, route)
 }
 
 func TestHeadOnBidirectionalEdge(t *testing.T) {
@@ -42,12 +48,12 @@ func TestHeadOnBidirectionalEdge(t *testing.T) {
 	v2 := ctxAt("v2", g, "d", math.Pi, 5)
 	tm.Observe(v1)
 	tm.Observe(v2)
-	r1 := tm.Request(v1, []string{"a", "b", "c", "d"})
+	r1 := req(tm, v1, []string{"a", "b", "c", "d"})
 	// v2 stands on d (and physically covers the end of edge cd): v1 gets a-b-c only
 	if r1.GrantedThrough != 2 || r1.Denied == nil || r1.Denied.HeldBy[0] != "v2" {
 		t.Fatalf("v1 should get a-b-c and be denied d (held by v2), got %d %+v", r1.GrantedThrough, r1.Denied)
 	}
-	r2 := tm.Request(v2, []string{"d", "c", "b", "a"})
+	r2 := req(tm, v2, []string{"d", "c", "b", "a"})
 	if r2.GrantedThrough != 0 || r2.Denied == nil {
 		t.Fatalf("v2 must be denied, got %+v", r2)
 	}
@@ -62,11 +68,11 @@ func TestCrossingZoneReleasedOnProgress(t *testing.T) {
 	v2 := ctxAt("v2", g, "s", -math.Pi/2, 5)
 	tm.Observe(v1)
 	tm.Observe(v2)
-	if r := tm.Request(v1, []string{"a", "b", "c"}); r.GrantedThrough != 2 {
+	if r := req(tm, v1, []string{"a", "b", "c"}); r.GrantedThrough != 2 {
 		t.Fatalf("v1 grant %+v", r)
 	}
 	// v2 wants to enter b (crossing zone) - held by v1
-	if r := tm.Request(v2, []string{"s", "b", "a"}); r.GrantedThrough != 0 {
+	if r := req(tm, v2, []string{"s", "b", "a"}); r.GrantedThrough != 0 {
 		t.Fatalf("v2 should be denied: %+v", r)
 	}
 	// v1 drives to c: reaches b then c
@@ -80,7 +86,7 @@ func TestCrossingZoneReleasedOnProgress(t *testing.T) {
 			t.Fatalf("v1 still holds %v after leaving", r.Resource)
 		}
 	}
-	if r := tm.Request(v2, []string{"s", "b", "a"}); r.GrantedThrough != 2 {
+	if r := req(tm, v2, []string{"s", "b", "a"}); r.GrantedThrough != 2 {
 		t.Fatalf("v2 should now be granted: %+v", r)
 	}
 	// v1 keeps its current node c
@@ -99,7 +105,7 @@ func TestCommsLossKeepsReservationsUncertain(t *testing.T) {
 	tm, g, clk := corridor()
 	v1 := ctxAt("v1", g, "a", 0, 5)
 	tm.Observe(v1)
-	tm.Request(v1, []string{"a", "b", "c"})
+	req(tm, v1, []string{"a", "b", "c"})
 	v1.Connected = false
 	tm.Observe(v1)
 	clk.Advance(time.Hour)
@@ -125,7 +131,7 @@ func TestCommsLossKeepsReservationsUncertain(t *testing.T) {
 	// another vehicle must keep away from the unknown vehicle's resources
 	v2 := ctxAt("v2", g, "d", math.Pi, 5)
 	tm.Observe(v2)
-	if r := tm.Request(v2, []string{"d", "c", "b"}); r.GrantedThrough != 0 {
+	if r := req(tm, v2, []string{"d", "c", "b"}); r.GrantedThrough != 0 {
 		t.Fatalf("v2 must not get resources held by an uncertain vehicle: %+v", r)
 	}
 	// a human confirms the physical state: manual release allowed
@@ -133,7 +139,7 @@ func TestCommsLossKeepsReservationsUncertain(t *testing.T) {
 		t.Fatal(err)
 	}
 	// requests from the uncertain vehicle are refused
-	if r := tm.Request(v1, []string{"a", "b"}); r.Denied == nil {
+	if r := req(tm, v1, []string{"a", "b"}); r.Denied == nil {
 		t.Fatal("uncertain vehicle must not be granted anything")
 	}
 	// comms back: reservations return to granted
@@ -153,8 +159,8 @@ func TestDeadlockDetection(t *testing.T) {
 	v2 := ctxAt("v2", g, "c", math.Pi, 3)
 	tm.Observe(v1)
 	tm.Observe(v2)
-	r1 := tm.Request(v1, []string{"b", "c", "d"})
-	r2 := tm.Request(v2, []string{"c", "b", "a"})
+	r1 := req(tm, v1, []string{"b", "c", "d"})
+	r2 := req(tm, v2, []string{"c", "b", "a"})
 	if r1.GrantedThrough != 0 || r2.GrantedThrough != 0 {
 		t.Fatalf("both should be denied: %+v %+v", r1, r2)
 	}
@@ -199,12 +205,12 @@ func TestSingleLaneDirection(t *testing.T) {
 	v3 := ctxAt("v3", g, "d", math.Pi, 5)
 	tm.Observe(v1)
 	tm.Observe(v3)
-	if r := tm.Request(v1, []string{"a", "b"}); r.GrantedThrough != 1 {
+	if r := req(tm, v1, []string{"a", "b"}); r.GrantedThrough != 1 {
 		t.Fatalf("v1 %+v", r)
 	}
 	// same direction, capacity 3: a follower may enter (but the node b is held by v1 so it
 	// can only request as far as geometry/capacity allows). Opposite direction is refused.
-	r := tm.Request(v3, []string{"d", "c"})
+	r := req(tm, v3, []string{"d", "c"})
 	if r.GrantedThrough != 0 || r.Denied == nil || r.Denied.Reason != "single lane occupied in opposite direction" {
 		t.Fatalf("opposite direction must be refused: %+v", r)
 	}
@@ -215,7 +221,7 @@ func TestDisabledZoneRefused(t *testing.T) {
 	g.Zones["cross"].Enabled = false
 	v1 := ctxAt("v1", g, "a", 0, 5)
 	tm.Observe(v1)
-	r := tm.Request(v1, []string{"a", "b"})
+	r := req(tm, v1, []string{"a", "b"})
 	if r.GrantedThrough != 0 || r.Denied == nil || r.Denied.Reason != "zone temporarily unavailable" {
 		t.Fatalf("%+v", r)
 	}
@@ -286,8 +292,8 @@ func TestFortyVehiclesInvariants(t *testing.T) {
 				newRoute(v, nil)
 				continue
 			}
-			rest := v.route[v.pos:]
-			res := tm.Request(v.ctx, rest)
+			v.ctx.RouteIndex = v.pos
+			res := tm.Request(v.ctx, v.route)
 			if res.GrantedThrough == 0 && res.Denied != nil {
 				// fleet-core policy: after waiting a while, replan around the
 				// contested resource using congestion costs
@@ -305,7 +311,7 @@ func TestFortyVehiclesInvariants(t *testing.T) {
 				continue
 			}
 			v.waiting = 0
-			if res.GrantedThrough > 0 {
+			if res.GrantedThrough > v.pos {
 				// advance one node, heading chosen like the vehicle would
 				v.pos++
 				n := g.Nodes[v.route[v.pos]]

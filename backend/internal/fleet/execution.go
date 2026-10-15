@@ -42,6 +42,23 @@ type execution struct {
 	deadlockID       string
 	isCharge         bool
 	isReturn         bool
+	lastOrderAt      time.Time
+}
+
+func appendUnique(list []string, items ...string) []string {
+	for _, it := range items {
+		found := false
+		for _, l := range list {
+			if l == it {
+				found = true
+				break
+			}
+		}
+		if !found {
+			list = append(list, it)
+		}
+	}
+	return list
 }
 
 // loadOnBoard reports whether the mission load may be on the vehicle.
@@ -320,8 +337,8 @@ func (c *Core) stepExecution(vid string, now time.Time) {
 	if m.Status == core.MissionSuspended && !ex.pausedByOperator && !m.LoadOnBoardUnverified {
 		_, _ = c.missions.Resume(m.ID)
 		m.Status = core.MissionExecuting
-		ex.sentThrough = -1 // re-send the order after reconnection
-		ex.orderID = ""
+		// the vehicle kept (or lost) its order during the outage: the re-base
+		// logic below detects a lost order from the reported orderId
 	}
 	if m.Status != core.MissionExecuting {
 		return
@@ -405,46 +422,95 @@ func (c *Core) stepExecution(vid string, now time.Time) {
 	}
 	// traffic reservations for the remaining route
 	cur := c.currentNode(v, r, g.g)
-	if cur != ex.route[ex.routeIdx] {
-		// vehicle is not where the route says (manual move / relocalisation): replan from here
-		if cur != "" && !r.state.Driving {
-			ex.replanRequested = true
-		}
+	routeNode := g.g.Nodes[ex.route[ex.routeIdx]]
+	offRoute := false
+	if cur != "" && !r.state.Driving && routeNode != nil && routeNode.Point().Dist(core.Point{X: r.state.Pose.X, Y: r.state.Pose.Y}) > 3.0 {
+		// vehicle clearly stands somewhere else (manual move / relocalisation): replan from here
+		offRoute = true
 	}
-	if ex.replanRequested && !r.state.Driving && ex.routeIdx >= ex.sentThrough {
-		if c.replanExecution(vid, m, cur) {
+	if !offRoute && cur != "" {
+		cur = ex.route[ex.routeIdx]
+	}
+	atBaseEnd := !r.state.Driving && ex.routeIdx >= ex.sentThrough && cur != "" && (ex.orderID == "" || r.state.OrderID == ex.orderID)
+	if offRoute && (ex.orderID == "" || r.state.OrderID == ex.orderID) {
+		c.log.Warn("vehicle off its route, replanning", "vehicle", v.Name, "expected", ex.route[ex.routeIdx], "at", cur)
+		c.traffic.ClearRoute(vid)
+		if !c.replanExecution(vid, m, cur) {
+			return
+		}
+		atBaseEnd = false
+	}
+	if ex.replanRequested && atBaseEnd {
+		switch {
+		case c.replanExecution(vid, m, cur):
+			ex.replanRequested = false
+		case ex.deadlockID != "" && c.backoff(vid, m, cur):
+			ex.replanRequested = false
+		case ex.deadlockID != "":
+			c.traffic.ResolveDeadlock(ex.deadlockID, "no alternative route; "+v.Name+" waits")
+			ex.deadlockID = ""
+			ex.replanRequested = false
+			ex.forcedAvoidNodes, ex.forcedAvoidEdges = nil, nil
+		default:
 			ex.replanRequested = false
 		}
 	}
-	ctx := traffic.VehicleCtx{ID: vid, SiteID: v.SiteID, Pose: r.state.Pose, Envelope: r.state.LoadEnvelope, Priority: m.Priority, CurrentNode: ex.route[ex.routeIdx], Connected: true}
-	res := c.traffic.Request(ctx, ex.route[ex.routeIdx:])
-	granted := ex.routeIdx + res.GrantedThrough
+	// an order the vehicle did not take over (rejected or lost): re-base a new
+	// order on the node where the vehicle actually stands
+	if ex.orderID != "" && r.state.OrderID != ex.orderID && now.Sub(ex.lastOrderAt) > 5*time.Second && !r.state.Driving && cur != "" {
+		idx := -1
+		for i := ex.routeIdx; i < len(ex.route); i++ {
+			if ex.route[i] == cur {
+				idx = i
+				break
+			}
+		}
+		c.log.Warn("vehicle did not take the order, re-basing", "vehicle", v.Name, "reported", r.state.OrderID, "expected", ex.orderID, "node", cur)
+		if idx >= 0 {
+			ex.routeIdx = idx
+			c.traffic.ClearRoute(vid)
+			ex.orderID, ex.sentThrough = "", -1
+		} else if !c.replanExecution(vid, m, cur) {
+			ex.lastOrderAt = now
+		}
+	}
+	ctx := traffic.VehicleCtx{ID: vid, SiteID: v.SiteID, Pose: r.state.Pose, Envelope: r.state.LoadEnvelope, Priority: m.Priority, CurrentNode: ex.route[ex.routeIdx], Connected: true, RouteIndex: ex.routeIdx}
+	res := c.traffic.Request(ctx, ex.route)
+	granted := res.GrantedThrough
+	if traffic.Strict {
+		if gt := c.traffic.GrantedThrough(vid); gt != res.GrantedThrough && res.GrantedThrough > ex.routeIdx {
+			panic(fmt.Sprintf("traffic result %d but GrantedThrough() %d for %s (denied=%+v) sentThrough=%d orderID=%q", res.GrantedThrough, gt, v.Name, res.Denied, ex.sentThrough, ex.orderID))
+		}
+	}
 	// a blocking action on an intermediate node: do not release beyond it until done
 	for i, s := range m.Steps {
 		if s.Status != core.StepDone && s.Action != core.StepMove && ex.stepAt[i] > ex.routeIdx && ex.stepAt[i] < granted {
 			granted = ex.stepAt[i]
 		}
 	}
-	if res.Denied != nil && res.GrantedThrough == 0 {
+	if res.Denied != nil && res.GrantedThrough <= ex.routeIdx {
 		if ex.waitingSince.IsZero() {
 			ex.waitingSince = now
-		} else if now.Sub(ex.waitingSince) > c.cfg.ReplanAfter && ex.routeIdx >= ex.sentThrough {
-			var avoidN, avoidE []string
-			if res.Denied.Resource.Type == core.ResNode {
-				avoidN = append(avoidN, res.Denied.Resource.ID)
+		} else if now.Sub(ex.waitingSince) > c.cfg.ReplanAfter && atBaseEnd {
+			// accumulate what blocked us so successive replans route further away
+			switch res.Denied.Resource.Type {
+			case core.ResNode:
+				ex.forcedAvoidNodes = appendUnique(ex.forcedAvoidNodes, res.Denied.Resource.ID)
+			case core.ResEdge:
+				ex.forcedAvoidEdges = appendUnique(ex.forcedAvoidEdges, res.Denied.Resource.ID)
 			}
-			if res.Denied.Resource.Type == core.ResEdge {
-				avoidE = append(avoidE, res.Denied.Resource.ID)
-			}
-			ex.forcedAvoidNodes, ex.forcedAvoidEdges = avoidN, avoidE
 			if c.replanExecution(vid, m, cur) {
 				ex.waitingSince = time.Time{}
+				granted = ex.routeIdx // the new route has no grants yet: next tick requests them
 			} else {
-				ex.waitingSince = now // no alternative: keep waiting
+				ex.waitingSince = now // no alternative yet: keep waiting, keep the avoid set
 			}
 		}
 	} else {
 		ex.waitingSince = time.Time{}
+		if res.GrantedThrough > ex.routeIdx {
+			ex.forcedAvoidNodes, ex.forcedAvoidEdges = nil, nil
+		}
 	}
 	if granted > ex.sentThrough || ex.orderID == "" {
 		c.sendOrder(vid, m, ex, g.g, granted)
@@ -503,8 +569,14 @@ func (c *Core) sendOrder(vid string, m *core.Mission, ex *execution, g *mapmgr.G
 			startIdx = ex.routeIdx
 		}
 	}
+	ex.lastOrderAt = c.clock.Now()
 	if releasedThrough < startIdx {
 		releasedThrough = startIdx
+	}
+	if traffic.Strict && releasedThrough > ex.routeIdx {
+		if gt := c.traffic.GrantedThrough(vid); releasedThrough > gt {
+			panic(fmt.Sprintf("core: releasing %s through %d (%s) but traffic granted through %d; route=%v routeIdx=%d", v.Name, releasedThrough, ex.route[releasedThrough], gt, ex.route, ex.routeIdx))
+		}
 	}
 	o := gateway.BuildOrder(g, mapID, ex.orderID, ex.updateID, ex.route, startIdx, releasedThrough, routeActions(m, ex), maxSpeed, r.state.Pose.Theta)
 	if err := c.gw.SendOrder(vid, o); err != nil {
@@ -528,7 +600,14 @@ func (c *Core) replanExecution(vid string, m *core.Mission, cur string) bool {
 	if model != nil {
 		maxSpeed = model.MaxSpeedMs
 	}
-	route, stepAt, err := c.planMission(g.g, m, cur, r.state.LoadEnvelope, m.Load.MassKg, maxSpeed, ex.forcedAvoidNodes, ex.forcedAvoidEdges)
+	// first try to route around every vehicle currently standing still, then
+	// fall back to the forced avoid set only (congestion costs still apply)
+	occupied := c.traffic.OccupiedNodes(v.SiteID, vid)
+	avoidN := appendUnique(append([]string{}, ex.forcedAvoidNodes...), occupied...)
+	route, stepAt, err := c.planMission(g.g, m, cur, r.state.LoadEnvelope, m.Load.MassKg, maxSpeed, avoidN, ex.forcedAvoidEdges)
+	if err != nil {
+		route, stepAt, err = c.planMission(g.g, m, cur, r.state.LoadEnvelope, m.Load.MassKg, maxSpeed, ex.forcedAvoidNodes, ex.forcedAvoidEdges)
+	}
 	if err != nil {
 		return false
 	}
@@ -549,7 +628,6 @@ func (c *Core) replanExecution(vid string, m *core.Mission, cur string) bool {
 	ex.routeIdx = 0
 	ex.stepAt = stepAt
 	ex.replans++
-	ex.forcedAvoidNodes, ex.forcedAvoidEdges = nil, nil
 	// a new order (VDA 5050: a different orderId starting at the current node)
 	ex.orderID = ""
 	ex.sentThrough = -1
@@ -607,22 +685,9 @@ func (c *Core) handleDeadlock(res traffic.Resolution) {
 	ex.forcedAvoidEdges = append(ex.forcedAvoidEdges, res.AvoidEdges...)
 	ex.replanRequested = true
 	ex.deadlockID = res.DeadlockID
-	m, err := c.missions.Get(ex.missionID)
-	if err != nil {
-		return
-	}
-	r := c.rt[res.VehicleID]
-	g := c.graphs[v.SiteID]
-	cur := c.currentNode(v, r, g.g)
-	if !c.replanExecution(res.VehicleID, m, cur) {
-		// no alternative route: back off to the nearest free waiting / parking node
-		if c.backoff(res.VehicleID, m, cur) {
-			ex.replanRequested = false
-		} else {
-			c.traffic.ResolveDeadlock(res.DeadlockID, "no alternative; vehicle waits")
-			ex.deadlockID = ""
-		}
-	}
+	// the replan itself happens in stepExecution once the vehicle stands still
+	// at the end of its released base (a new order must start where the
+	// vehicle is, never between two nodes)
 }
 
 // backoff inserts a detour to a free waiting node before continuing.
@@ -643,16 +708,19 @@ func (c *Core) backoff(vid string, m *core.Mission, cur string) bool {
 	best := ""
 	bestLen := math.Inf(1)
 	var bestRoute []string
+	avoidN := append([]string{}, ex.forcedAvoidNodes...)
+	for n := range occupied {
+		avoidN = append(avoidN, n)
+	}
+	skip := map[string]bool{}
+	for _, an := range avoidN {
+		skip[an] = true
+	}
 	for _, n := range g.m.Nodes {
-		if (n.Type != core.NodeWaiting && n.Type != core.NodeParking && n.Type != core.NodeWaypoint) || occupied[n.ID] || n.ID == cur {
+		if (n.Type != core.NodeWaiting && n.Type != core.NodeParking && n.Type != core.NodeWaypoint) || occupied[n.ID] || skip[n.ID] || n.ID == cur {
 			continue
 		}
-		for _, an := range ex.forcedAvoidNodes {
-			if an == n.ID {
-				continue
-			}
-		}
-		rt, err := c.planner.Plan(planner.Request{Graph: g.g, From: cur, To: n.ID, Envelope: r.state.LoadEnvelope, AvoidNodes: ex.forcedAvoidNodes, AvoidEdges: ex.forcedAvoidEdges})
+		rt, err := c.planner.Plan(planner.Request{Graph: g.g, From: cur, To: n.ID, Envelope: r.state.LoadEnvelope, AvoidNodes: avoidN, AvoidEdges: ex.forcedAvoidEdges, Congestion: c.traffic.Congestion(v.SiteID)})
 		if err != nil || len(rt.NodeIDs) > 4 {
 			continue
 		}
@@ -678,7 +746,6 @@ func (c *Core) backoff(vid string, m *core.Mission, cur string) bool {
 	ex.route, ex.routeIdx, ex.stepAt = full, 0, stepAt
 	ex.orderID, ex.sentThrough = "", -1
 	ex.replans++
-	ex.forcedAvoidNodes, ex.forcedAvoidEdges = nil, nil
 	_, _ = c.missions.Update(m.ID, func(mm *core.Mission) (string, error) {
 		mm.RouteNodeIDs = full
 		mm.History = append(mm.History, core.MissionEvent{At: c.clock.Now(), Status: mm.Status, Message: "backing off to " + best + " to resolve a deadlock"})

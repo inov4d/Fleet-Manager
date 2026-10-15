@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +31,9 @@ type VehicleCtx struct {
 	Priority    int
 	CurrentNode string // node the vehicle stands on / last reached
 	Connected   bool
+	// RouteIndex is the index of CurrentNode in the route passed to Request
+	// (routes may visit a node twice). Negative when the vehicle has no route.
+	RouteIndex int
 }
 
 // Denial explains why the next segment could not be granted.
@@ -42,7 +46,7 @@ type Denial struct {
 // GrantResult is the outcome of a reservation request.
 type GrantResult struct {
 	// GrantedThrough is the index in the route of the last node the vehicle
-	// may travel to (0 = may not leave its current node).
+	// may travel to (equal to the current index = may not leave its node).
 	GrantedThrough int
 	Denied         *Denial
 }
@@ -80,6 +84,18 @@ type hold struct {
 	bodyNow        geometry.Polygon
 }
 
+// Trace, when set, receives a line for every grant / release (debugging).
+var Trace func(string)
+
+// Strict enables internal consistency assertions (tests).
+var Strict bool
+
+func trace(format string, a ...any) {
+	if Trace != nil {
+		Trace(fmt.Sprintf(format, a...))
+	}
+}
+
 // Manager is the traffic manager.
 type Manager struct {
 	mu        sync.Mutex
@@ -92,12 +108,18 @@ type Manager struct {
 	deadlocks []core.Deadlock
 	resolved  int
 	laneDir   map[string]map[string]float64 // single lane zone -> vehicle -> heading
+	recent    map[string]*recentDeadlock    // cycle key -> last occurrence
+}
+
+type recentDeadlock struct {
+	at      time.Time
+	victims map[string]bool
 }
 
 // New creates a manager.
 func New(settings core.TrafficSettings, clock core.Clock) *Manager {
 	return &Manager{clock: clock, settings: settings, graphs: map[string]*mapmgr.Graph{}, resv: map[string]*core.Reservation{},
-		byRes: map[string]map[string]bool{}, holds: map[string]*hold{}, laneDir: map[string]map[string]float64{}}
+		byRes: map[string]map[string]bool{}, holds: map[string]*hold{}, laneDir: map[string]map[string]float64{}, recent: map[string]*recentDeadlock{}}
 }
 
 // Settings returns the current settings.
@@ -145,6 +167,13 @@ func (m *Manager) SetGraph(siteID string, g *mapmgr.Graph) {
 	}
 	for _, h := range m.holds {
 		if h.ctx.SiteID == siteID {
+			for _, s := range h.segments {
+				for _, id := range s.resIDs {
+					if r := m.resv[id]; r != nil {
+						m.release(r)
+					}
+				}
+			}
 			h.segments = nil
 		}
 	}
@@ -166,6 +195,8 @@ func (m *Manager) Observe(ctx VehicleCtx) {
 	}
 	prevNode := h.ctx.CurrentNode
 	h.ctx = ctx
+	// last known body: kept while disconnected so others keep their distance
+	h.bodyNow = geometry.Rect(ctx.Pose, ctx.Envelope.LengthM, ctx.Envelope.WidthM)
 	if !ctx.Connected {
 		if !h.uncertain {
 			h.uncertain = true
@@ -191,7 +222,6 @@ func (m *Manager) Observe(ctx VehicleCtx) {
 		h.lastPose = ctx.Pose
 		h.hasPose = true
 	}
-	h.bodyNow = geometry.Rect(ctx.Pose, ctx.Envelope.LengthM, ctx.Envelope.WidthM)
 	g := m.graph(ctx.SiteID)
 	if g == nil {
 		return
@@ -201,7 +231,11 @@ func (m *Manager) Observe(ctx VehicleCtx) {
 	// unless the body still physically occupies the resource.
 	reached := -1
 	for i, s := range h.segments {
-		if s.to == ctx.CurrentNode {
+		if ctx.RouteIndex >= 0 {
+			if s.index <= ctx.RouteIndex {
+				reached = i
+			}
+		} else if s.to == ctx.CurrentNode {
 			reached = i
 		}
 	}
@@ -261,6 +295,9 @@ func (m *Manager) recomputeHoldings(h *hold, g *mapmgr.Graph) {
 	// is physically there, so these are granted unconditionally and marked active)
 	for key := range needed {
 		ref := parseKey(key)
+		if ref.Type == core.ResNode {
+			trace("STAND %s node %s (holders %v)", h.ctx.ID, ref.ID, m.holdersOf(ref, h.ctx.ID))
+		}
 		r := m.newReservation(h.ctx, ref, 0)
 		r.State = core.ResvActive
 		h.standingIDs = append(h.standingIDs, r.ID)
@@ -323,6 +360,9 @@ func (m *Manager) release(r *core.Reservation) {
 	if r.State == core.ResvReleased {
 		return
 	}
+	if r.Resource.Type == core.ResNode {
+		trace("RELEASE %s node %s (%s)", r.VehicleID, r.Resource.ID, r.State)
+	}
 	now := m.clock.Now()
 	r.State = core.ResvReleased
 	r.ReleasedAt = &now
@@ -361,9 +401,10 @@ func (m *Manager) capacity(g *mapmgr.Graph, ref core.ResourceRef) int {
 	return 1
 }
 
-// Request asks for the next segments of route (route[0] must be the current
-// node). Already granted segments are kept; new ones are granted in order
-// until a resource conflict, up to the lookahead window.
+// Request asks for the next segments of the full route; route[ctx.RouteIndex]
+// must be the current node (RouteIndex 0 for a route starting at the vehicle).
+// Already granted segments are kept; new ones are granted in order until a
+// resource conflict, up to the lookahead window.
 func (m *Manager) Request(ctx VehicleCtx, route []string) GrantResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -373,16 +414,21 @@ func (m *Manager) Request(ctx VehicleCtx, route []string) GrantResult {
 		m.holds[ctx.ID] = h
 	}
 	g := m.graph(ctx.SiteID)
-	if g == nil || len(route) == 0 || route[0] != ctx.CurrentNode {
-		return GrantResult{GrantedThrough: 0, Denied: &Denial{Reason: "route does not start at the current node"}}
+	cur := ctx.RouteIndex
+	if cur < 0 {
+		cur = 0
+	}
+	if g == nil || cur >= len(route) || route[cur] != ctx.CurrentNode {
+		return GrantResult{GrantedThrough: cur, Denied: &Denial{Reason: "route index does not match the current node"}}
 	}
 	if h.uncertain || !ctx.Connected {
 		return GrantResult{Denied: &Denial{Reason: "vehicle state uncertain"}}
 	}
-	// drop granted segments that no longer match the route (replanning)
+	// drop granted segments that no longer match the route (replanning) or
+	// that lie behind the vehicle
 	valid := h.segments[:0]
 	for _, s := range h.segments {
-		if s.index < len(route) && route[s.index] == s.to && s.index > 0 && route[s.index-1] == s.from {
+		if s.index > cur && s.index < len(route) && route[s.index] == s.to && route[s.index-1] == s.from {
 			valid = append(valid, s)
 		} else {
 			for _, id := range s.resIDs {
@@ -393,8 +439,7 @@ func (m *Manager) Request(ctx VehicleCtx, route []string) GrantResult {
 		}
 	}
 	h.segments = valid
-	// renumber: segments are indexed in route order
-	granted := 0
+	granted := cur
 	heading := ctx.Pose.Theta
 	for _, s := range h.segments {
 		granted = s.index
@@ -406,7 +451,7 @@ func (m *Manager) Request(ctx VehicleCtx, route []string) GrantResult {
 	if lookahead <= 0 {
 		lookahead = 3
 	}
-	for next := granted + 1; next < len(route) && next <= lookahead; next++ {
+	for next := granted + 1; next < len(route) && next <= cur+lookahead; next++ {
 		from, to := route[next-1], route[next]
 		e := g.EdgeBetween(from, to)
 		if e == nil || !e.Enabled {
@@ -419,6 +464,12 @@ func (m *Manager) Request(ctx VehicleCtx, route []string) GrantResult {
 			return GrantResult{GrantedThrough: granted, Denied: d}
 		}
 		// grant
+		trace("GRANT %s seg %d %s->%s (holders of %s: %v)", ctx.ID, next, from, to, to, m.holdersOf(core.ResourceRef{Type: core.ResNode, ID: to}, ctx.ID))
+		if Strict {
+			if hs := m.holdersOf(core.ResourceRef{Type: core.ResNode, ID: to}, ctx.ID); len(hs) >= m.capacity(g, core.ResourceRef{Type: core.ResNode, ID: to}) {
+				panic(fmt.Sprintf("traffic: granting %s to %s while held by %v", to, ctx.ID, hs))
+			}
+		}
 		for _, ref := range m.segmentResources(g, seg) {
 			r := m.newReservation(ctx, ref, next)
 			seg.resIDs = append(seg.resIDs, r.ID)
@@ -618,12 +669,23 @@ func (m *Manager) Congestion(siteID string) func(edgeID string) float64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	g := m.graph(siteID)
-	counts := map[string]int{}
+	cost := map[string]float64{}
 	for _, r := range m.resv {
 		if r.State == core.ResvReleased || r.SiteID != siteID {
 			continue
 		}
-		counts[r.Resource.Key()]++
+		// a standing vehicle is a much stronger obstacle than a planned passage
+		w := 40.0
+		switch r.State {
+		case core.ResvActive:
+			w = 120
+		case core.ResvUncertain:
+			w = 300
+		}
+		if r.Resource.Type == core.ResZone {
+			w /= 3
+		}
+		cost[r.Resource.Key()] += w
 	}
 	return func(edgeID string) float64 {
 		if g == nil {
@@ -633,11 +695,31 @@ func (m *Manager) Congestion(siteID string) func(edgeID string) float64 {
 		if e == nil {
 			return 0
 		}
-		c := counts[core.ResourceRef{Type: core.ResEdge, ID: edgeID}.Key()]
-		c += counts[core.ResourceRef{Type: core.ResNode, ID: e.From}.Key()]
-		c += counts[core.ResourceRef{Type: core.ResNode, ID: e.To}.Key()]
-		return float64(c) * 15
+		c := cost[core.ResourceRef{Type: core.ResEdge, ID: edgeID}.Key()]
+		c += cost[core.ResourceRef{Type: core.ResNode, ID: e.From}.Key()] / 2
+		c += cost[core.ResourceRef{Type: core.ResNode, ID: e.To}.Key()]
+		return c
 	}
+}
+
+// OccupiedNodes returns the nodes on which other vehicles currently stand
+// (active or uncertain reservations), excluding the given vehicle.
+func (m *Manager) OccupiedNodes(siteID, except string) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range m.resv {
+		if r.SiteID != siteID || r.VehicleID == except || r.Resource.Type != core.ResNode {
+			continue
+		}
+		if (r.State == core.ResvActive || r.State == core.ResvUncertain) && !seen[r.Resource.ID] {
+			seen[r.Resource.ID] = true
+			out = append(out, r.Resource.ID)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Blocked returns vehicles that have not progressed for longer than the
@@ -705,14 +787,36 @@ func (m *Manager) DetectDeadlocks() []Resolution {
 		if m.activeDeadlock(cycle) {
 			continue
 		}
-		// choose the victim: lowest priority, tie-break on shortest wait
-		victim := cycle[0]
-		for _, v := range cycle {
-			hv, hc := m.holds[v], m.holds[victim]
-			if hv.ctx.Priority < hc.ctx.Priority || (hv.ctx.Priority == hc.ctx.Priority && hv.waitingSince.After(hc.waitingSince)) {
+		// choose the victim: lowest priority, tie-break on shortest wait. When
+		// the same cycle reappears shortly after a resolution, rotate to a
+		// vehicle that has not been the victim yet so both sides try to yield.
+		sorted := append([]string(nil), cycle...)
+		sort.Slice(sorted, func(i, j int) bool {
+			hi, hj := m.holds[sorted[i]], m.holds[sorted[j]]
+			if hi.ctx.Priority != hj.ctx.Priority {
+				return hi.ctx.Priority < hj.ctx.Priority
+			}
+			return hi.waitingSince.After(hj.waitingSince)
+		})
+		ckey := strings.Join(sorted, "|")
+		now := m.clock.Now()
+		rec := m.recent[ckey]
+		if rec == nil || now.Sub(rec.at) > 2*time.Minute {
+			rec = &recentDeadlock{victims: map[string]bool{}}
+			m.recent[ckey] = rec
+		}
+		rec.at = now
+		victim := sorted[0]
+		for _, v := range sorted {
+			if !rec.victims[v] {
 				victim = v
+				break
 			}
 		}
+		if rec.victims[victim] { // everyone tried: start over
+			rec.victims = map[string]bool{}
+		}
+		rec.victims[victim] = true
 		var resources, avoidEdges, avoidNodes []string
 		for _, v := range cycle {
 			if h := m.holds[v]; h.waitingFor != nil {
@@ -731,8 +835,7 @@ func (m *Manager) DetectDeadlocks() []Resolution {
 				avoidNodes = append(avoidNodes, m.holds[v].ctx.CurrentNode)
 			}
 		}
-		sort.Strings(cycle)
-		d := core.Deadlock{ID: uuid.NewString(), SiteID: m.holds[victim].ctx.SiteID, VehicleIDs: cycle, ResourceIDs: resources, DetectedAt: m.clock.Now(),
+		d := core.Deadlock{ID: uuid.NewString(), SiteID: m.holds[victim].ctx.SiteID, VehicleIDs: sorted, ResourceIDs: resources, DetectedAt: m.clock.Now(),
 			Resolution: fmt.Sprintf("replan %s avoiding %v", victim, resources)}
 		m.deadlocks = append(m.deadlocks, d)
 		res = append(res, Resolution{DeadlockID: d.ID, VehicleID: victim, Action: "replan", AvoidEdges: avoidEdges, AvoidNodes: avoidNodes})

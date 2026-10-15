@@ -16,9 +16,11 @@ import (
 // Memory is an in-memory store with optional JSON snapshot persistence.
 type Memory struct {
 	mu       sync.RWMutex
+	saveMu   sync.Mutex
 	path     string
 	dirty    bool
 	stopSave chan struct{}
+	loopDone chan struct{}
 
 	Sites        map[string]*core.Site
 	Models       map[string]*core.VehicleModel
@@ -68,6 +70,7 @@ func NewMemory(path string) (*Memory, error) {
 			return nil, err
 		}
 		m.stopSave = make(chan struct{})
+		m.loopDone = make(chan struct{})
 		go m.saveLoop()
 	}
 	return m, nil
@@ -132,6 +135,7 @@ func (m *Memory) load() error {
 }
 
 func (m *Memory) saveLoop() {
+	defer close(m.loopDone)
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
 	for {
@@ -150,11 +154,13 @@ func (m *Memory) saveLoop() {
 	}
 }
 
-// Save writes the snapshot to disk.
+// Save writes the snapshot to disk (serialised: one writer at a time).
 func (m *Memory) Save() error {
 	if m.path == "" {
 		return nil
 	}
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
 	m.mu.Lock()
 	s := snapshot{UserHash: map[string]string{}, KeyHash: map[string]string{}, Settings: m.Settings}
 	for _, v := range m.Sites {
@@ -217,8 +223,8 @@ func (m *Memory) Save() error {
 func (m *Memory) Close() error {
 	if m.stopSave != nil {
 		close(m.stopSave)
+		<-m.loopDone // the loop performs the final save
 		m.stopSave = nil
-		return m.Save()
 	}
 	return nil
 }

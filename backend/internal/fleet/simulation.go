@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"github.com/inov4d/fleet-manager/internal/core"
+	"github.com/inov4d/fleet-manager/internal/geometry"
 	"github.com/inov4d/fleet-manager/internal/mapmgr"
 	"github.com/inov4d/fleet-manager/internal/sim"
+	"github.com/inov4d/fleet-manager/internal/traffic"
 )
 
 // SimulationScenario describes automatic mission generation.
@@ -240,6 +242,14 @@ func (c *Core) spawnSimVehicle(siteID, modelID, nodeID string) (*core.VehicleWit
 	}
 	c.vehicles[v.ID] = &v
 	c.rt[v.ID] = c.newRuntime(v.ID)
+	// pre-seed the known spawn position so the traffic manager sees the body
+	// before the first state message arrives
+	rt := c.rt[v.ID]
+	rt.state.Pose = core.Pose{X: n.X, Y: n.Y}
+	rt.state.LastNodeID = n.ID
+	rt.state.PositionInitialized = true
+	rt.state.LoadEnvelope = geometry.EffectiveFootprint(model.LengthM, model.WidthM, 0, 0, v.SafetyMarginM, v.LocalizationUncertaintyM)
+	c.traffic.Observe(traffic.VehicleCtx{ID: v.ID, SiteID: siteID, Pose: rt.state.Pose, Envelope: rt.state.LoadEnvelope, CurrentNode: n.ID, Connected: false, RouteIndex: -1})
 	c.gw.Register(v.ID, v.Manufacturer, v.SerialNumber)
 	battery := 60 + c.simState.rng.Float64()*40
 	cfg := sim.AgentConfig{VehicleID: v.ID, Manufacturer: v.Manufacturer, Serial: serial, Interface: c.cfg.VDAInterface, MapID: ge.m.ID, Model: *model,
