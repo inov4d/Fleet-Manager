@@ -44,8 +44,9 @@ export function useApi<T>(fetcher: () => Promise<T>, deps: readonly unknown[], e
       return;
     }
     void run();
+    const counter = runId;
     return () => {
-      runId.current++;
+      counter.current++;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, run, ...deps]);

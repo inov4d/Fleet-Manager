@@ -38,7 +38,7 @@ func TestIntersects(t *testing.T) {
 		t.Fatal("containment should count as intersection")
 	}
 	// concave zone (U shape) with a rectangle inside the notch
-	u := Polygon{{0, 0}, {10, 0}, {10, 10}, {7, 10}, {7, 3}, {3, 3}, {3, 10}, {0, 10}}
+	u := Polygon{{X: 0, Y: 0}, {X: 10, Y: 0}, {X: 10, Y: 10}, {X: 7, Y: 10}, {X: 7, Y: 3}, {X: 3, Y: 3}, {X: 3, Y: 10}, {X: 0, Y: 10}}
 	inNotch := Rect(core.Pose{X: 5, Y: 7}, 2, 2)
 	if Intersects(u, inNotch) {
 		t.Fatal("rectangle in the notch must not intersect the U")
@@ -82,34 +82,34 @@ func TestEffectiveFootprint(t *testing.T) {
 }
 
 func TestSegmentPolygon(t *testing.T) {
-	z := Polygon{{0, 0}, {4, 0}, {4, 4}, {0, 4}}
-	if !SegmentIntersectsPolygon(Point{-1, 2}, Point{5, 2}, z) {
+	z := Polygon{{X: 0, Y: 0}, {X: 4, Y: 0}, {X: 4, Y: 4}, {X: 0, Y: 4}}
+	if !SegmentIntersectsPolygon(Point{X: -1, Y: 2}, Point{X: 5, Y: 2}, z) {
 		t.Fatal("crossing segment")
 	}
-	if SegmentIntersectsPolygon(Point{-1, 5}, Point{5, 5}, z) {
+	if SegmentIntersectsPolygon(Point{X: -1, Y: 5}, Point{X: 5, Y: 5}, z) {
 		t.Fatal("segment above")
 	}
-	if !SegmentIntersectsPolygon(Point{1, 1}, Point{2, 2}, z) {
+	if !SegmentIntersectsPolygon(Point{X: 1, Y: 1}, Point{X: 2, Y: 2}, z) {
 		t.Fatal("segment inside")
 	}
 }
 
 func TestConvexHull(t *testing.T) {
-	h := ConvexHull([]Point{{0, 0}, {1, 1}, {2, 0}, {1, 0.5}, {0, 2}, {2, 2}})
+	h := ConvexHull([]Point{{X: 0, Y: 0}, {X: 1, Y: 1}, {X: 2, Y: 0}, {X: 1, Y: 0.5}, {X: 0, Y: 2}, {X: 2, Y: 2}})
 	if len(h) != 4 {
 		t.Fatalf("hull has %d points: %v", len(h), h)
 	}
 }
 
 func TestOffset(t *testing.T) {
-	sq := Polygon{{0, 0}, {2, 0}, {2, 2}, {0, 2}}
+	sq := Polygon{{X: 0, Y: 0}, {X: 2, Y: 0}, {X: 2, Y: 2}, {X: 0, Y: 2}}
 	o := Offset(sq, 0.5)
 	mn, mx := Bounds(o)
 	if math.Abs(mn.X+0.5) > 1e-9 || math.Abs(mx.X-2.5) > 1e-9 || math.Abs(mn.Y+0.5) > 1e-9 || math.Abs(mx.Y-2.5) > 1e-9 {
 		t.Fatalf("offset bounds %v %v", mn, mx)
 	}
 	// clockwise input must also grow outward
-	cw := Polygon{{0, 0}, {0, 2}, {2, 2}, {2, 0}}
+	cw := Polygon{{X: 0, Y: 0}, {X: 0, Y: 2}, {X: 2, Y: 2}, {X: 2, Y: 0}}
 	o2 := Offset(cw, 0.5)
 	mn2, mx2 := Bounds(o2)
 	if math.Abs(mn2.X+0.5) > 1e-9 || math.Abs(mx2.X-2.5) > 1e-9 {
