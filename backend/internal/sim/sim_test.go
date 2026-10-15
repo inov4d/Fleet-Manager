@@ -13,7 +13,7 @@ import (
 )
 
 func TestAgentFollowsOrderOverVDA5050(t *testing.T) {
-	bus := transport.NewMemory()
+	bus := transport.NewMemorySync()
 	clk := core.NewScaledClock(1)
 	g := mapmgr.NewGraph(mapmgr.DemoMap("s"))
 	model := core.BuiltinModels()[0]
@@ -102,7 +102,7 @@ func TestAgentFollowsOrderOverVDA5050(t *testing.T) {
 }
 
 func TestOrderValidationErrorReported(t *testing.T) {
-	bus := transport.NewMemory()
+	bus := transport.NewMemorySync()
 	clk := core.NewScaledClock(1)
 	a := NewAgent(AgentConfig{VehicleID: "v1", Manufacturer: "m", Serial: "s", Model: core.BuiltinModels()[0]}, bus, clk)
 	_ = a.Start()
@@ -123,7 +123,7 @@ func TestOrderValidationErrorReported(t *testing.T) {
 }
 
 func TestEngineStepping(t *testing.T) {
-	bus := transport.NewMemory()
+	bus := transport.NewMemorySync()
 	clk := core.NewScaledClock(5)
 	e := NewEngine(bus, clk)
 	_, err := e.Spawn(AgentConfig{VehicleID: "v1", Manufacturer: "m", Serial: "s1", Model: core.BuiltinModels()[1], BatteryPct: 50})

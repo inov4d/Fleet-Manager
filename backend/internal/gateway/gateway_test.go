@@ -21,7 +21,7 @@ func stateJSON(headerID int, serial string, x float64) []byte {
 }
 
 func TestGatewayStateFlowAndTimeouts(t *testing.T) {
-	bus := transport.NewMemory()
+	bus := transport.NewMemorySync()
 	clk := core.NewManualClock(time.Now())
 	gw := New(bus, "uagv", clk, nil, 5*time.Second)
 	var states []string
@@ -66,7 +66,7 @@ func TestGatewayStateFlowAndTimeouts(t *testing.T) {
 }
 
 func TestOrderBuildAndSend(t *testing.T) {
-	bus := transport.NewMemory()
+	bus := transport.NewMemorySync()
 	gw := New(bus, "uagv", core.RealClock{}, nil, time.Second)
 	_ = gw.Start(nil, nil)
 	gw.Register("agv-1", "inov4d", "S1")

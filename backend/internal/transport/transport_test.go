@@ -24,7 +24,7 @@ func TestMatch(t *testing.T) {
 }
 
 func TestMemoryRetainedAndWildcard(t *testing.T) {
-	m := NewMemory()
+	m := NewMemorySync()
 	_ = m.Publish("x/1/connection", []byte("ONLINE"), true)
 	var got []string
 	unsub, _ := m.Subscribe("x/+/connection", func(topic string, p []byte) { got = append(got, topic+"="+string(p)) })
