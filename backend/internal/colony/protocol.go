@@ -19,7 +19,7 @@
 // Local negotiation of right of way between neighbouring agents:
 //
 //	fleet/<site>/board/conflicts/<vid>  retained  board -> agent   Conflict (who blocks me, since when)
-//	fleet/<site>/agents/<vid>/inbox               agent -> agent   Proposal / Answer (peer to peer)
+//	fleet/<site>/agents/<vid>/inbox               agent -> agent   Proposal / Resolution (peer to peer, along the wait chain)
 //	fleet/<site>/board/yields                     agent -> board   Yield (the agreed concession)
 package colony
 
@@ -122,25 +122,36 @@ type Conflict struct {
 	Active    bool             `json:"active"`
 }
 
-// Proposal opens a negotiation: "one of us must give way, here is my cost of yielding".
-type Proposal struct {
-	Nonce     string           `json:"nonce"`
-	From      string           `json:"from"`
-	To        string           `json:"to"`
-	Resource  core.ResourceRef `json:"resource"`
+// ChainMember is one agent of a wait chain with its cost of yielding.
+type ChainMember struct {
+	VehicleID string           `json:"vehicleId"`
 	YieldCost float64          `json:"yieldCost"`
-	WaitedS   float64          `json:"waitedS"`
-	At        time.Time        `json:"at"`
+	WaitsFor  core.ResourceRef `json:"waitsFor"` // resource this member waits for (empty for a free terminal)
 }
 
-// Answer closes a negotiation with the peer's own cost; both sides apply the
-// same deterministic rule, so they agree on who yields without a referee.
-type Answer struct {
-	Nonce     string  `json:"nonce"`
-	From      string  `json:"from"`
-	To        string  `json:"to"`
-	YieldCost float64 `json:"yieldCost"`
-	IYield    bool    `json:"iYield"`
+// Proposal travels along the wait chain: the originator sends it to the
+// neighbour blocking it; a blocked neighbour appends itself and forwards it to
+// its own blocker, until it reaches a free agent, closes a cycle, or runs out
+// of hops. Chain[0] is the originator, Chain[len-1] the last forwarder.
+type Proposal struct {
+	Nonce string        `json:"nonce"`
+	From  string        `json:"from"`
+	To    string        `json:"to"`
+	Chain []ChainMember `json:"chain"`
+	Hops  int           `json:"hops"`
+	At    time.Time     `json:"at"`
+}
+
+// Resolution is sent by the terminal agent to every member of the chain: the
+// cheapest member yields to the member waiting on it. Every agent applies the
+// same rule (DecideChain), so the decision needs no referee.
+type Resolution struct {
+	Nonce       string        `json:"nonce"`
+	From        string        `json:"from"`
+	Chain       []ChainMember `json:"chain"`
+	Yielder     string        `json:"yielder"`
+	Beneficiary string        `json:"beneficiary"`
+	Cycle       bool          `json:"cycle"`
 }
 
 // Yield is the agreed concession, sent to the board which executes it safely.
@@ -151,6 +162,7 @@ type Yield struct {
 	Resource    core.ResourceRef `json:"resource"`
 	MyCost      float64          `json:"myCost"`
 	PeerCost    float64          `json:"peerCost"`
+	Chain       []string         `json:"chain"` // the wait chain that was negotiated
 	Reason      string           `json:"reason"`
 	At          time.Time        `json:"at"`
 }
@@ -159,11 +171,38 @@ func TopicConflicts(site, vid string) string { return "fleet/" + site + "/board/
 func TopicInbox(site, vid string) string     { return "fleet/" + site + "/agents/" + vid + "/inbox" }
 func TopicYields(site string) string         { return "fleet/" + site + "/board/yields" }
 
-// DecideYield applies the shared rule: the cheaper side yields; ties go to the
-// lexicographically smaller vehicle id. It returns true when "me" yields.
+// DecideYield applies the shared rule between two agents: the cheaper side
+// yields; ties go to the lexicographically smaller vehicle id. It returns true
+// when "me" yields.
 func DecideYield(me string, myCost float64, peer string, peerCost float64) bool {
 	if myCost != peerCost {
 		return myCost < peerCost
 	}
 	return me < peer
+}
+
+// DecideChain picks the yielder of a wait chain (the cheapest member, ties by
+// id) and the beneficiary: the member waiting on the yielder, i.e. its
+// predecessor in the chain, or the last member when the chain is a cycle
+// closed on the originator.
+func DecideChain(chain []ChainMember, cycle bool) (yielder, beneficiary string) {
+	if len(chain) == 0 {
+		return "", ""
+	}
+	best := 0
+	for i := 1; i < len(chain); i++ {
+		if chain[i].YieldCost < chain[best].YieldCost || (chain[i].YieldCost == chain[best].YieldCost && chain[i].VehicleID < chain[best].VehicleID) {
+			best = i
+		}
+	}
+	yielder = chain[best].VehicleID
+	switch {
+	case best > 0:
+		beneficiary = chain[best-1].VehicleID
+	case cycle && len(chain) > 1:
+		beneficiary = chain[len(chain)-1].VehicleID
+	default:
+		beneficiary = ""
+	}
+	return yielder, beneficiary
 }

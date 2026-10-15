@@ -49,8 +49,8 @@ dans le processus `fleetd`.
 | `fleet/<site>/map` (retenu) | centre → agents | carte active (même JSON que l'API) |
 | `fleet/<site>/vehicles/<vehicleId>` (retenu) | centre → agent | `{"id","siteId","modelId","model":{…},"enabled"}` |
 | `fleet/<site>/board/conflicts/<vehicleId>` (retenu) | centre → agent | `{"vehicleId","resource":{type,id},"heldBy":[],"since","active"}` |
-| `fleet/<site>/agents/<vehicleId>/inbox` | agent → agent | `Proposal {"nonce","from","to","resource","yieldCost","waitedS","at"}` ou `Answer {"nonce","from","to","yieldCost","iYield"}` |
-| `fleet/<site>/board/yields` | agent → centre | `{"nonce","vehicleId","beneficiary","resource","myCost","peerCost","reason","at"}` |
+| `fleet/<site>/agents/<vehicleId>/inbox` | agent → agent | `Proposal {"nonce","from","to","chain":[{"vehicleId","yieldCost","waitsFor"}],"hops","at"}` (transmise le long de la chaîne) ou `Resolution {"nonce","from","chain","yielder","beneficiary","cycle"}` |
+| `fleet/<site>/board/yields` | agent → centre | `{"nonce","vehicleId","beneficiary","resource","myCost","peerCost","chain":[],"reason","at"}` |
 
 L'agent lit sa propre position sur le topic VDA 5050 `state` de son contrôleur. Toute
 implémentation respectant ces messages (Python, ROS 2, automate…) peut remplacer l'agent de
@@ -73,7 +73,16 @@ deux agents règlent alors le conflit **entre eux**, pair à pair :
    sécurité : un agent au travail recule ou se replanifie en évitant le chemin du bénéficiaire
    (mécanisme de repli existant, réservations toujours vérifiées) ; un agent inactif reçoit une
    mission « pas de côté » vers le nœud libre le plus proche hors du chemin du bénéficiaire.
-4. En mode colonie, le centre **laisse 30 s** à la négociation locale avant d'appliquer sa
+4. **Propagation le long de la chaîne d'attente** : si le voisin sollicité est lui-même bloqué,
+   il ne répond pas seul ; il ajoute son coût à la proposition et la **transmet à celui qui le
+   bloque**, et ainsi de suite (au plus `MaxChainHops`, 8). La chaîne s'arrête sur un agent
+   libre, sur une boucle fermée (le prochain détenteur fait déjà partie de la chaîne : c'est un
+   interblocage à N véhicules) ou à la limite de sauts. Le dernier maillon applique la règle
+   commune `DecideChain` : **le maillon le moins coûteux cède à celui qui l'attend** (son
+   prédécesseur dans la chaîne ; dans une boucle, l'initiateur cède au dernier maillon) et
+   envoie la **résolution** à tous les membres. Un maillon qui n'est pas un agent ne transmet
+   pas : la proposition expire en 5 s et le centre reprend la main.
+5. En mode colonie, le centre **laisse 30 s** à la négociation locale avant d'appliquer sa
    propre résolution d'interblocage ; une cession négociée clôt l'interblocage correspondant
    (« negotiated: X gives way to Y »). Un voisin qui n'est pas un agent (ou injoignable) ne
    répond pas : la proposition expire en 3 s et le centre reprend la main au bout des 30 s.

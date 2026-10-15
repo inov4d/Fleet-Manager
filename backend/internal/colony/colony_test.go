@@ -2,6 +2,7 @@ package colony
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -240,8 +241,8 @@ func TestLocalNegotiationIdleNeighbourYields(t *testing.T) {
 				t.Fatalf("unexpected yield %+v", y)
 			}
 			s1, s2 := v1.Snapshot(), v2.Snapshot()
-			if s2.Yielded != 1 || s1.Passed != 1 || len(s1.Negotiations) != 1 || s1.Negotiations[0].IYield {
-				t.Fatalf("snapshots v1=%+v v2=%+v", s1, s2)
+			if s2.Yielded != 1 || s1.Passed != 1 || len(s1.Negotiations) != 1 || s1.Negotiations[0].IYield || len(y.Chain) != 2 {
+				t.Fatalf("snapshots v1=%+v v2=%+v yield=%+v", s1, s2, y)
 			}
 			if st := board.Stats(); st.Negotiated != 1 {
 				t.Fatalf("board stats %+v", st)
@@ -259,5 +260,114 @@ func TestDecideYieldIsSymmetric(t *testing.T) {
 	}
 	if !DecideYield("a", 3, "b", 3) || DecideYield("b", 3, "a", 3) {
 		t.Fatal("ties must be broken consistently")
+	}
+}
+
+// chainFixture builds n agents and a fake arbiter with the given conflicts.
+func chainFixture(t *testing.T, n int, conflicts []Conflict, granted map[string]string) (*fakeArbiter, *BoardServer, []*Agent) {
+	t.Helper()
+	bus := transport.NewMemory()
+	model := core.BuiltinModels()[0]
+	arb := &fakeArbiter{granted: granted, busy: map[string]bool{}, m: mapmgr.DemoMap("s"), conflicts: conflicts}
+	for i := 1; i <= n; i++ {
+		id := fmt.Sprintf("v%d", i)
+		arb.infos = append(arb.infos, VehicleInfo{ID: id, SiteID: "s", ModelID: "AGV20T", Model: model, Enabled: true})
+	}
+	for _, v := range granted {
+		arb.busy[v] = true
+	}
+	board := NewBoardServer(bus, arb, nil, 100*time.Millisecond)
+	if err := board.Start([]string{"s"}, 100*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(board.Stop)
+	var agents []*Agent
+	for i := 1; i <= n; i++ {
+		id := fmt.Sprintf("v%d", i)
+		a := NewAgent(AgentConfig{SiteID: "s", VehicleID: id, Manufacturer: "m", Serial: id, NegotiateAfter: 300 * time.Millisecond}, bus, nil)
+		if err := a.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(a.Stop)
+		agents = append(agents, a)
+		_ = bus.Publish(vda5050.Topic("uagv", "m", id, vda5050.TopicState), stateMsg(id, fmt.Sprintf("N0%d", i-1), float64(10+30*(i-1)), 10, 90), false)
+	}
+	return arb, board, agents
+}
+
+func node(id string) core.ResourceRef { return core.ResourceRef{Type: core.ResNode, ID: id} }
+
+func waitYield(t *testing.T, arb *fakeArbiter) Yield {
+	t.Helper()
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		arb.mu.Lock()
+		n := len(arb.yields)
+		arb.mu.Unlock()
+		if n > 0 {
+			return arb.yields[0]
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("no negotiated yield")
+	return Yield{}
+}
+
+// TestChainNegotiationFreeTerminalYields: v1 waits on v2, v2 waits on v3, v3
+// is idle. The proposal travels v1 -> v2 -> v3; v3 (cost 0) steps aside for v2.
+func TestChainNegotiationFreeTerminalYields(t *testing.T) {
+	since := time.Now().Add(-10 * time.Second)
+	arb, _, agents := chainFixture(t, 3, []Conflict{
+		{VehicleID: "v1", Resource: node("N01"), HeldBy: []string{"v2"}, Since: since, Active: true},
+		{VehicleID: "v2", Resource: node("N02"), HeldBy: []string{"v3"}, Since: since, Active: true},
+		{VehicleID: "v3"},
+	}, map[string]string{"t1": "v1", "t2": "v2"})
+	y := waitYield(t, arb)
+	if y.VehicleID != "v3" || y.Beneficiary != "v2" || y.Resource.ID != "N02" || len(y.Chain) != 3 {
+		t.Fatalf("unexpected yield %+v", y)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if s := agents[0].Snapshot(); s.Passed != 1 || len(s.Negotiations) != 1 || len(s.Negotiations[0].Chain) != 3 {
+		t.Fatalf("originator snapshot %+v", s)
+	}
+}
+
+// TestChainNegotiationCycle: v1 -> v2 -> v3 -> v1, all working; the cheapest
+// member yields to the member waiting on it.
+func TestChainNegotiationCycle(t *testing.T) {
+	since := time.Now().Add(-10 * time.Second)
+	arb, _, agents := chainFixture(t, 3, []Conflict{
+		{VehicleID: "v1", Resource: node("N01"), HeldBy: []string{"v2"}, Since: since, Active: true},
+		{VehicleID: "v2", Resource: node("N02"), HeldBy: []string{"v3"}, Since: since, Active: true},
+		{VehicleID: "v3", Resource: node("N00"), HeldBy: []string{"v1"}, Since: since, Active: true},
+	}, map[string]string{"t1": "v1", "t2": "v2", "t3": "v3"})
+	// make v2 the cheapest: it has no task urgency, v1 and v3 carry loads
+	for _, id := range []string{"v1", "v3"} {
+		s := vda5050.State{Header: vda5050.Header{HeaderID: 2, Version: vda5050.Version, Manufacturer: "m", SerialNumber: id}, OperatingMode: vda5050.OpAutomatic,
+			NodeStates: []vda5050.NodeState{}, EdgeStates: []vda5050.EdgeState{}, ActionStates: []vda5050.ActionState{}, Errors: []vda5050.Error{},
+			BatteryState: vda5050.BatteryState{BatteryCharge: 90}, SafetyState: vda5050.SafetyState{EStop: vda5050.EStopNone},
+			Loads: []vda5050.Load{{LoadID: "l"}}, AGVPosition: &vda5050.AGVPosition{X: 10, Y: 10, MapID: "m", PositionInitialized: true}}
+		b, _ := json.Marshal(s)
+		_ = agents[0].tr.Publish(vda5050.Topic("uagv", "m", id, vda5050.TopicState), b, false)
+	}
+	y := waitYield(t, arb)
+	if y.VehicleID != "v2" || y.Beneficiary != "v1" || len(y.Chain) != 3 {
+		t.Fatalf("unexpected yield %+v", y)
+	}
+}
+
+func TestDecideChain(t *testing.T) {
+	chain := []ChainMember{{VehicleID: "a", YieldCost: 30}, {VehicleID: "b", YieldCost: 12}, {VehicleID: "c", YieldCost: 25}}
+	if y, b := DecideChain(chain, false); y != "b" || b != "a" {
+		t.Fatalf("got %s -> %s", y, b)
+	}
+	// cheapest is the originator of a cycle: it yields to the last member (who waits on it)
+	chain[0].YieldCost = 1
+	if y, b := DecideChain(chain, true); y != "a" || b != "c" {
+		t.Fatalf("cycle got %s -> %s", y, b)
+	}
+	// cheapest originator without a cycle: nobody waits on it, no beneficiary
+	if y, b := DecideChain(chain, false); y != "a" || b != "" {
+		t.Fatalf("open chain got %s -> %s", y, b)
 	}
 }

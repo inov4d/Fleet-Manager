@@ -73,7 +73,7 @@ export function ColonyPanel() {
               <ul className="text-xs text-muted space-y-1">
                 {d.stats.yields.slice(-6).reverse().map((y) => (
                   <li key={y.nonce + y.vehicleId}>
-                    <span className="text-warning">{y.vehicleId}</span> cède {y.resource.type} {y.resource.id} à {y.beneficiary} (coûts {y.myCost.toFixed(1)} vs {y.peerCost.toFixed(1)})
+                    <span className="text-warning">{y.vehicleId}</span> cède {y.resource.type} {y.resource.id} à {y.beneficiary} (coût {y.myCost.toFixed(1)}, chaîne de {y.chain?.length ?? 2} : {(y.chain ?? []).join(" → ")})
                   </li>
                 ))}
               </ul>

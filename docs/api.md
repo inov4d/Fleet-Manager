@@ -179,9 +179,9 @@ GET `/colony/board?siteId=` →
  "tasks": [{"id","type","origin","destination","nodes":[],"priority","urgency","massKg","loadPresent","requiredModelId","createdAt"}],
  "agents": [{"vehicleId","battery","node","assignment":{"taskId","status":"idle"|"assigned"|"executing"},"claims","wins",
              "decisions":[{"taskId","cost","urgency","delayS","reason","ok"}],
-             "yielded","passed","negotiations":[{"peer","resource","myCost","peerCost","iYield","at"}]}],   // in-process agents (simulated vehicles)
+             "yielded","passed","negotiations":[{"peer","resource","myCost","peerCost","iYield","chain":[],"at"}]}],   // in-process agents (simulated vehicles)
  "stats": {"granted","rejected","negotiated","recent":[{"claimId","taskId","vehicleId","granted","reason","competing"}],
-           "yields":[{"nonce","vehicleId","beneficiary","resource":{"type","id"},"myCost","peerCost","reason","at"}]}}
+           "yields":[{"nonce","vehicleId","beneficiary","resource":{"type","id"},"myCost","peerCost","chain":[],"reason","at"}]}}
 ```
 
 ## Traffic

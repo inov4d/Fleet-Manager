@@ -714,6 +714,7 @@ export interface ColonyNegotiation {
   myCost: number;
   peerCost: number;
   iYield: boolean;
+  chain: string[];
   at: string;
 }
 
@@ -737,6 +738,7 @@ export interface ColonyYield {
   resource: { type: string; id: string };
   myCost: number;
   peerCost: number;
+  chain: string[];
   reason: string;
   at: string;
 }

@@ -33,16 +33,18 @@ type AgentConfig struct {
 	MaxClaimDelay      time.Duration
 	ParkAfterIdle      time.Duration
 	// NegotiateAfter is how long an agent waits behind a neighbour before
-	// proposing a negotiation; NegotiateCooldown spaces negotiations per peer.
+	// proposing a negotiation; NegotiateCooldown spaces negotiations per peer;
+	// MaxChainHops bounds the propagation along the wait chain.
 	NegotiateAfter    time.Duration
 	NegotiateCooldown time.Duration
+	MaxChainHops      int
 }
 
 // DefaultAgentConfig returns the reference thresholds.
 func DefaultAgentConfig() AgentConfig {
 	return AgentConfig{Interface: vda5050.DefaultInterface, LowBatteryPct: 30, CriticalBatteryPct: 15, ReserveBatteryPct: 10,
 		ClaimScale: 0.02, MinClaimDelay: 100 * time.Millisecond, MaxClaimDelay: 3 * time.Second, ParkAfterIdle: 3 * time.Minute,
-		NegotiateAfter: 4 * time.Second, NegotiateCooldown: 20 * time.Second}
+		NegotiateAfter: 4 * time.Second, NegotiateCooldown: 20 * time.Second, MaxChainHops: 8}
 }
 
 // Publisher is the minimal transport the agent needs (satisfied by transport.Transport).
@@ -53,11 +55,12 @@ type Publisher interface {
 
 // Negotiation is a logged right-of-way exchange (for explainability).
 type Negotiation struct {
-	Peer     string    `json:"peer"`
+	Peer     string    `json:"peer"` // the designated yielder (or the beneficiary when I yield)
 	Resource string    `json:"resource"`
 	MyCost   float64   `json:"myCost"`
-	PeerCost float64   `json:"peerCost"`
+	PeerCost float64   `json:"peerCost"` // the yielder's cost
 	IYield   bool      `json:"iYield"`
+	Chain    []string  `json:"chain"`
 	At       time.Time `json:"at"`
 }
 
@@ -145,6 +148,9 @@ func NewAgent(cfg AgentConfig, tr Publisher, log *slog.Logger) *Agent {
 	}
 	if cfg.NegotiateCooldown <= 0 {
 		cfg.NegotiateCooldown = d.NegotiateCooldown
+	}
+	if cfg.MaxChainHops <= 0 {
+		cfg.MaxChainHops = d.MaxChainHops
 	}
 	if log == nil {
 		log = slog.Default()
@@ -582,7 +588,8 @@ func (a *Agent) yieldCost() float64 {
 	return cost
 }
 
-// negotiate opens a proposal towards the neighbour that blocks us.
+// negotiate opens a proposal towards the neighbour that blocks us. The
+// proposal then travels along the wait chain (see onProposal).
 func (a *Agent) negotiate() {
 	a.mu.Lock()
 	cf := a.conflict
@@ -596,95 +603,153 @@ func (a *Agent) negotiate() {
 		return
 	}
 	a.lastTalk[peer] = time.Now()
-	pr := Proposal{Nonce: uuid.NewString(), From: a.cfg.VehicleID, To: peer, Resource: cf.Resource, YieldCost: a.yieldCost(), WaitedS: time.Since(a.conflictSeen).Seconds(), At: time.Now().UTC()}
+	pr := Proposal{Nonce: uuid.NewString(), From: a.cfg.VehicleID, To: peer, Hops: 1, At: time.Now().UTC(),
+		Chain: []ChainMember{{VehicleID: a.cfg.VehicleID, YieldCost: a.yieldCost(), WaitsFor: cf.Resource}}}
 	a.openProposal = &pr
 	nonce := pr.Nonce
-	time.AfterFunc(3*time.Second, func() {
+	time.AfterFunc(5*time.Second, func() {
 		a.mu.Lock()
 		if a.openProposal != nil && a.openProposal.Nonce == nonce {
-			a.openProposal = nil // no answer: the peer is not an agent (or is unreachable)
+			a.openProposal = nil // no resolution: a link of the chain is not an agent (or unreachable)
 		}
 		a.mu.Unlock()
 	})
 	a.mu.Unlock()
-	payload, _ := json.Marshal(pr)
-	_ = a.tr.Publish(TopicInbox(a.cfg.SiteID, peer), payload, false)
-	a.log.Debug("negotiation proposed", "to", peer, "resource", cf.Resource.Key(), "myCost", pr.YieldCost)
+	a.send(peer, pr)
+	a.log.Debug("negotiation proposed", "to", peer, "resource", cf.Resource.Key(), "myCost", pr.Chain[0].YieldCost)
+}
+
+func (a *Agent) send(to string, msg any) {
+	payload, _ := json.Marshal(msg)
+	_ = a.tr.Publish(TopicInbox(a.cfg.SiteID, to), payload, false)
 }
 
 func (a *Agent) onInbox(_ string, p []byte) {
 	var probe struct {
-		Nonce  string  `json:"nonce"`
-		From   string  `json:"from"`
-		IYield *bool   `json:"iYield"`
-		Cost   float64 `json:"yieldCost"`
+		Yielder *string `json:"yielder"`
+		Chain   []any   `json:"chain"`
 	}
-	if json.Unmarshal(p, &probe) != nil || probe.From == "" {
+	if json.Unmarshal(p, &probe) != nil {
 		return
 	}
-	if probe.IYield != nil {
-		var ans Answer
-		if json.Unmarshal(p, &ans) == nil {
-			a.onAnswer(ans)
+	if probe.Yielder != nil {
+		var r Resolution
+		if json.Unmarshal(p, &r) == nil {
+			a.onResolution(r)
 		}
 		return
 	}
 	var pr Proposal
-	if json.Unmarshal(p, &pr) == nil {
+	if json.Unmarshal(p, &pr) == nil && pr.From != "" {
 		a.onProposal(pr)
 	}
 }
 
-// onProposal answers with our own cost and applies the shared rule.
+// onProposal either forwards the proposal to the agent blocking us (we are a
+// link of the chain) or, as the terminal link, decides and notifies everyone.
 func (a *Agent) onProposal(pr Proposal) {
 	a.mu.Lock()
-	my := a.yieldCost()
-	iYield := DecideYield(a.cfg.VehicleID, my, pr.From, pr.YieldCost)
-	a.lastTalk[pr.From] = time.Now()
-	a.negotiations = append(a.negotiations, Negotiation{Peer: pr.From, Resource: pr.Resource.Key(), MyCost: my, PeerCost: pr.YieldCost, IYield: iYield, At: time.Now().UTC()})
-	if len(a.negotiations) > 20 {
-		a.negotiations = a.negotiations[len(a.negotiations)-20:]
+	for _, m := range pr.Chain {
+		if m.VehicleID == a.cfg.VehicleID {
+			a.mu.Unlock()
+			return // already a member: stale duplicate
+		}
 	}
+	me := ChainMember{VehicleID: a.cfg.VehicleID, YieldCost: a.yieldCost()}
+	if a.conflict != nil {
+		me.WaitsFor = a.conflict.Resource
+	}
+	chain := append(append([]ChainMember(nil), pr.Chain...), me)
+	a.lastTalk[pr.From] = time.Now()
+	next := ""
+	if a.conflict != nil && len(a.conflict.HeldBy) > 0 {
+		next = a.conflict.HeldBy[0]
+	}
+	inChain := false
+	for _, m := range chain {
+		if m.VehicleID == next {
+			inChain = true
+		}
+	}
+	cycle := next != "" && inChain
+	terminal := next == "" || cycle || pr.Hops >= a.cfg.MaxChainHops
 	a.mu.Unlock()
-	ans := Answer{Nonce: pr.Nonce, From: a.cfg.VehicleID, To: pr.From, YieldCost: my, IYield: iYield}
-	payload, _ := json.Marshal(ans)
-	_ = a.tr.Publish(TopicInbox(a.cfg.SiteID, pr.From), payload, false)
-	if iYield {
-		a.publishYield(pr.Nonce, pr.From, pr.Resource, my, pr.YieldCost)
+	if !terminal {
+		fwd := Proposal{Nonce: pr.Nonce, From: a.cfg.VehicleID, To: next, Chain: chain, Hops: pr.Hops + 1, At: pr.At}
+		a.send(next, fwd)
+		a.log.Debug("negotiation forwarded along the wait chain", "to", next, "hops", fwd.Hops)
+		return
+	}
+	yielder, beneficiary := DecideChain(chain, cycle)
+	res := Resolution{Nonce: pr.Nonce, From: a.cfg.VehicleID, Chain: chain, Yielder: yielder, Beneficiary: beneficiary, Cycle: cycle}
+	for _, m := range chain {
+		if m.VehicleID == a.cfg.VehicleID {
+			a.onResolution(res)
+		} else {
+			a.send(m.VehicleID, res)
+		}
 	}
 }
 
-// onAnswer completes our own proposal.
-func (a *Agent) onAnswer(ans Answer) {
+// onResolution applies the chain decision locally.
+func (a *Agent) onResolution(r Resolution) {
 	a.mu.Lock()
-	if a.openProposal == nil || a.openProposal.Nonce != ans.Nonce {
+	if a.openProposal != nil && a.openProposal.Nonce == r.Nonce {
+		a.openProposal = nil
+	}
+	var mine, yc float64
+	var resource core.ResourceRef
+	member := false
+	for i, m := range r.Chain {
+		if m.VehicleID == a.cfg.VehicleID {
+			mine, member = m.YieldCost, true
+			if i > 0 {
+				resource = r.Chain[i-1].WaitsFor // what my predecessor waits for: a resource I hold
+			}
+		}
+		if m.VehicleID == r.Yielder {
+			yc = m.YieldCost
+		}
+	}
+	if !member {
 		a.mu.Unlock()
 		return
 	}
-	pr := *a.openProposal
-	a.openProposal = nil
-	iYield := DecideYield(a.cfg.VehicleID, pr.YieldCost, ans.From, ans.YieldCost)
-	a.negotiations = append(a.negotiations, Negotiation{Peer: ans.From, Resource: pr.Resource.Key(), MyCost: pr.YieldCost, PeerCost: ans.YieldCost, IYield: iYield, At: time.Now().UTC()})
+	ids := make([]string, 0, len(r.Chain))
+	for _, m := range r.Chain {
+		ids = append(ids, m.VehicleID)
+	}
+	iYield := r.Yielder == a.cfg.VehicleID && r.Beneficiary != ""
+	peer := r.Yielder
+	if iYield {
+		peer = r.Beneficiary
+		// the resource the beneficiary waits for
+		for _, m := range r.Chain {
+			if m.VehicleID == r.Beneficiary {
+				resource = m.WaitsFor
+			}
+		}
+	}
+	a.negotiations = append(a.negotiations, Negotiation{Peer: peer, Resource: resource.Key(), MyCost: mine, PeerCost: yc, IYield: iYield, Chain: ids, At: time.Now().UTC()})
 	if len(a.negotiations) > 20 {
 		a.negotiations = a.negotiations[len(a.negotiations)-20:]
 	}
+	if !iYield {
+		a.passed++
+	}
 	a.mu.Unlock()
 	if iYield {
-		a.publishYield(pr.Nonce, ans.From, pr.Resource, pr.YieldCost, ans.YieldCost)
-	} else {
-		a.mu.Lock()
-		a.passed++
-		a.mu.Unlock()
+		a.publishYield(r.Nonce, r.Beneficiary, resource, mine, yc, ids)
 	}
 }
 
-func (a *Agent) publishYield(nonce, beneficiary string, res core.ResourceRef, my, peer float64) {
+func (a *Agent) publishYield(nonce, beneficiary string, res core.ResourceRef, my, peer float64, chain []string) {
 	a.mu.Lock()
 	a.yielded++
 	a.conflict = nil
 	a.mu.Unlock()
-	y := Yield{Nonce: nonce, VehicleID: a.cfg.VehicleID, Beneficiary: beneficiary, Resource: res, MyCost: my, PeerCost: peer,
-		Reason: fmt.Sprintf("negotiated: my yield cost %.1f < %.1f", my, peer), At: time.Now().UTC()}
+	y := Yield{Nonce: nonce, VehicleID: a.cfg.VehicleID, Beneficiary: beneficiary, Resource: res, MyCost: my, PeerCost: peer, Chain: chain,
+		Reason: fmt.Sprintf("negotiated along a chain of %d: my yield cost %.1f is the lowest", len(chain), my), At: time.Now().UTC()}
 	payload, _ := json.Marshal(y)
 	_ = a.tr.Publish(TopicYields(a.cfg.SiteID), payload, false)
 	a.log.Info("giving way", "to", beneficiary, "resource", res.Key(), "myCost", my, "peerCost", peer)
