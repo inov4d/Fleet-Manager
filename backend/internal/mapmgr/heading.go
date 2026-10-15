@@ -6,22 +6,29 @@ import (
 	"github.com/inov4d/fleet-manager/internal/core"
 )
 
+// AlignLengthM is the edge length above which an omnidirectional AGV aligns
+// its body with the edge (forward or reverse) instead of translating sideways:
+// a one-off rotation is cheaper than a long crawl at the lateral speed limit.
+const AlignLengthM = 12.0
+
 // TravelHeading decides the vehicle heading used to traverse an edge. An
 // omnidirectional AGV may drive forward, backward or sideways: for
 // MotionLateral the body keeps its heading and translates; for MotionForward it
 // aligns with the edge (forward or reverse); for MotionAny the orientation
-// requiring the smallest rotation is picked among the four body alignments.
-func TravelHeading(current, edgeHeading float64, motion core.Motion) float64 {
+// requiring the smallest rotation is picked among the four body alignments on
+// short edges, and among forward / reverse on edges longer than AlignLengthM.
+func TravelHeading(current, edgeHeading float64, motion core.Motion, lengthM float64) float64 {
 	norm := func(a float64) float64 { return math.Atan2(math.Sin(a), math.Cos(a)) }
 	switch motion {
 	case core.MotionLateral:
 		return current
 	case core.MotionForward:
-		cands := []float64{edgeHeading, edgeHeading + math.Pi}
-		return closest(current, cands, norm)
+		return closest(current, []float64{edgeHeading, edgeHeading + math.Pi}, norm)
 	default:
-		cands := []float64{edgeHeading, edgeHeading + math.Pi, edgeHeading + math.Pi/2, edgeHeading - math.Pi/2}
-		return closest(current, cands, norm)
+		if lengthM >= AlignLengthM {
+			return closest(current, []float64{edgeHeading, edgeHeading + math.Pi}, norm)
+		}
+		return closest(current, []float64{edgeHeading, edgeHeading + math.Pi, edgeHeading + math.Pi/2, edgeHeading - math.Pi/2}, norm)
 	}
 }
 

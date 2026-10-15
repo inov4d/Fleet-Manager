@@ -48,7 +48,7 @@ func BuildOrder(g *mapmgr.Graph, mapID, orderID string, updateID int, route []st
 				break
 			}
 			edgeHeading := g.Heading(route[i], route[i+1])
-			travel := mapmgr.TravelHeading(heading, edgeHeading, e.Motion)
+			travel := mapmgr.TravelHeading(heading, edgeHeading, e.Motion, g.Length(e))
 			heading = travel
 			speed := e.MaxSpeedMs
 			if maxSpeed > 0 && maxSpeed < speed {

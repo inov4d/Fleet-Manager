@@ -112,8 +112,10 @@ type Manager struct {
 }
 
 type recentDeadlock struct {
-	at      time.Time
-	victims map[string]bool
+	at       time.Time
+	victims  map[string]bool
+	deferred time.Time // no re-detection before this time (failed resolution)
+	id       string
 }
 
 // New creates a manager.
@@ -500,7 +502,7 @@ func (h *hold) setWaiting(ref core.ResourceRef, heldBy []string, now time.Time) 
 
 func (m *Manager) buildSegment(g *mapmgr.Graph, ctx VehicleCtx, idx int, from, to string, e *core.Edge, prevHeading float64) *segment {
 	edgeHeading := g.Heading(from, to)
-	travel := mapmgr.TravelHeading(prevHeading, edgeHeading, e.Motion)
+	travel := mapmgr.TravelHeading(prevHeading, edgeHeading, e.Motion, g.Length(e))
 	a := core.Pose{X: g.Nodes[from].X, Y: g.Nodes[from].Y, Theta: prevHeading}
 	b := core.Pose{X: g.Nodes[to].X, Y: g.Nodes[to].Y, Theta: travel}
 	samples := m.settings.Swept.Samples
@@ -674,11 +676,12 @@ func (m *Manager) Congestion(siteID string) func(edgeID string) float64 {
 		if r.State == core.ResvReleased || r.SiteID != siteID {
 			continue
 		}
-		// a standing vehicle is a much stronger obstacle than a planned passage
-		w := 40.0
+		// metre-equivalents of expected delay: a standing vehicle blocks for a
+		// while, a planned passage clears quickly, an unknown vehicle may never move
+		w := 15.0
 		switch r.State {
 		case core.ResvActive:
-			w = 120
+			w = 50
 		case core.ResvUncertain:
 			w = 300
 		}
@@ -764,9 +767,16 @@ func joined(s []string) string {
 func (m *Manager) DetectDeadlocks() []Resolution {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// only vehicles that are really stuck take part: nothing granted ahead,
+	// not moving, and waiting for a few seconds (transient refusals while a
+	// vehicle still drives on its granted base are not deadlocks)
+	now := m.clock.Now()
 	waits := map[string][]string{}
 	for vid, h := range m.holds {
-		if h.waitingFor == nil {
+		if h.waitingFor == nil || len(h.segments) > 0 || h.uncertain {
+			continue
+		}
+		if now.Sub(h.waitingSince) < 3*time.Second || (h.hasPose && now.Sub(h.lastProgressAt) < 2*time.Second) {
 			continue
 		}
 		waits[vid] = h.waitingOn
@@ -805,6 +815,9 @@ func (m *Manager) DetectDeadlocks() []Resolution {
 			rec = &recentDeadlock{victims: map[string]bool{}}
 			m.recent[ckey] = rec
 		}
+		if now.Before(rec.deferred) {
+			continue // a resolution failed recently: give the fleet time before retrying
+		}
 		rec.at = now
 		victim := sorted[0]
 		for _, v := range sorted {
@@ -837,6 +850,7 @@ func (m *Manager) DetectDeadlocks() []Resolution {
 		}
 		d := core.Deadlock{ID: uuid.NewString(), SiteID: m.holds[victim].ctx.SiteID, VehicleIDs: sorted, ResourceIDs: resources, DetectedAt: m.clock.Now(),
 			Resolution: fmt.Sprintf("replan %s avoiding %v", victim, resources)}
+		rec.id = d.ID
 		m.deadlocks = append(m.deadlocks, d)
 		res = append(res, Resolution{DeadlockID: d.ID, VehicleID: victim, Action: "replan", AvoidEdges: avoidEdges, AvoidNodes: avoidNodes})
 	}
@@ -870,7 +884,9 @@ func (m *Manager) activeDeadlock(cycle []string) bool {
 	return false
 }
 
-// ResolveDeadlock marks a deadlock as resolved.
+// ResolveDeadlock marks a deadlock as resolved. When the resolution failed
+// (how starts with "no alternative"), the same cycle is not reported again
+// for 20 seconds so the fleet can evolve before the next attempt.
 func (m *Manager) ResolveDeadlock(id, how string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -882,6 +898,13 @@ func (m *Manager) ResolveDeadlock(id, how string) {
 				m.deadlocks[i].Resolution = how
 			}
 			m.resolved++
+			if strings.HasPrefix(how, "no alternative") {
+				for _, rec := range m.recent {
+					if rec.id == id {
+						rec.deferred = now.Add(20 * time.Second)
+					}
+				}
+			}
 		}
 	}
 }

@@ -268,13 +268,20 @@ func (c *Core) Start() error {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		t := time.NewTicker(time.Second / time.Duration(c.cfg.TickHz))
-		defer t.Stop()
+		// the control loop follows simulated time: at time scale s the loop
+		// runs s times faster on the wall clock (bounded to 200 Hz)
 		for {
+			interval := time.Second / time.Duration(c.cfg.TickHz)
+			if sc := c.clock.Scale(); sc > 1 {
+				interval = time.Duration(float64(interval) / sc)
+				if interval < 5*time.Millisecond {
+					interval = 5 * time.Millisecond
+				}
+			}
 			select {
 			case <-stop:
 				return
-			case <-t.C:
+			case <-time.After(interval):
 				c.Tick()
 			}
 		}

@@ -164,6 +164,10 @@ func TestDeadlockDetection(t *testing.T) {
 	if r1.GrantedThrough != 0 || r2.GrantedThrough != 0 {
 		t.Fatalf("both should be denied: %+v %+v", r1, r2)
 	}
+	if len(tm.DetectDeadlocks()) != 0 {
+		t.Fatal("a cycle younger than a few seconds is not a deadlock yet")
+	}
+	clk.Advance(5 * time.Second)
 	res := tm.DetectDeadlocks()
 	if len(res) != 1 {
 		t.Fatalf("expected one deadlock resolution, got %v", res)
@@ -316,7 +320,7 @@ func TestFortyVehiclesInvariants(t *testing.T) {
 				v.pos++
 				n := g.Nodes[v.route[v.pos]]
 				e := g.EdgeBetween(v.route[v.pos-1], v.route[v.pos])
-				th := mapmgr.TravelHeading(v.ctx.Pose.Theta, g.Heading(v.route[v.pos-1], v.route[v.pos]), e.Motion)
+				th := mapmgr.TravelHeading(v.ctx.Pose.Theta, g.Heading(v.route[v.pos-1], v.route[v.pos]), e.Motion, g.Length(e))
 				v.ctx.CurrentNode = v.route[v.pos]
 				v.ctx.Pose = core.Pose{X: n.X, Y: n.Y, Theta: th}
 				tm.Observe(v.ctx)

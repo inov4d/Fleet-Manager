@@ -28,6 +28,9 @@ type Request struct {
 	Weights    Weights
 	// Congestion returns an extra cost in metre-equivalents for an edge (0 = free).
 	Congestion func(edgeID string) float64
+	// DirectedCost returns an extra cost for traversing an edge from node a to
+	// node b (used for head-on avoidance against other vehicles' intents).
+	DirectedCost func(edgeID, from, to string) float64
 }
 
 // Weights tune the cost components (metre equivalents).
@@ -242,6 +245,9 @@ func edgeCost(req Request, w Weights, from key, tr mapmgr.Traversal) float64 {
 	// congestion
 	if req.Congestion != nil {
 		cost += req.Congestion(e.ID) * w.Congestion
+	}
+	if req.DirectedCost != nil {
+		cost += req.DirectedCost(e.ID, tr.From, tr.To) * w.Congestion
 	}
 	// manoeuvre: heading change relative to the previous edge (or current heading)
 	newHeading := g.Heading(tr.From, tr.To)

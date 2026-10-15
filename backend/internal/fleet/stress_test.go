@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -16,6 +17,21 @@ import (
 // checks every 100 ms that no two vehicle bodies overlap and that no two
 // stopped vehicles report the same node.
 func TestFleetStressBodiesNeverOverlap(t *testing.T) {
+	runScenario(t, SimulationStart{Vehicles: 10, TimeScale: 20, Scenario: &SimulationScenario{Name: "randomTransport", MissionRatePerMin: 6}}, 75*time.Second, 3)
+}
+
+// TestFleetSingleVehicleBaseline calibrates the free-flow mission duration.
+func TestFleetSingleVehicleBaseline(t *testing.T) {
+	runScenario(t, SimulationStart{Vehicles: 1, TimeScale: 20, Scenario: &SimulationScenario{Name: "randomTransport", MissionRatePerMin: 6}}, 75*time.Second, 2)
+}
+
+// TestFleetModerateDensity measures throughput on the large demo layout.
+func TestFleetModerateDensity(t *testing.T) {
+	runScenario(t, SimulationStart{Vehicles: 14, TimeScale: 20, Scenario: &SimulationScenario{Name: "randomTransport", MissionRatePerMin: 8}}, 75*time.Second, 3)
+}
+
+func runScenario(t *testing.T, start SimulationStart, wall time.Duration, minCompleted int) {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("stress test")
 	}
@@ -50,10 +66,10 @@ func TestFleetStressBodiesNeverOverlap(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Stop()
-	if _, err := c.StartSimulation(SimulationStart{Vehicles: 10, TimeScale: 20, Scenario: &SimulationScenario{Name: "randomTransport", MissionRatePerMin: 6}}); err != nil {
+	if _, err := c.StartSimulation(start); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(75 * time.Second)
+	deadline := time.Now().Add(wall)
 	checks := 0
 	for time.Now().Before(deadline) {
 		time.Sleep(100 * time.Millisecond)
@@ -78,9 +94,27 @@ func TestFleetStressBodiesNeverOverlap(t *testing.T) {
 		}
 	}
 	k := c.KPIs("", time.Time{}, time.Time{})
-	t.Logf("stress: %d checks, completed=%d failed=%d deadlocksResolved=%d utilization=%.0f%% alarms=%d", checks, k.MissionsCompleted, k.MissionsFailed, k.DeadlocksResolved, k.FleetUtilizationPct, k.ActiveAlarms)
-	if k.MissionsCompleted < 3 {
-		t.Fatalf("fleet is not moving: %+v", k)
+	// moving ratio from telemetry: share of in-mission samples with speed > 0
+	inMission, moving := 0, 0
+	for _, v := range c.Vehicles("") {
+		samples, _ := c.Store().QueryTelemetry(context.Background(), v.Vehicle.ID, time.Time{}, time.Time{}, 0)
+		for _, s := range samples {
+			if s.MissionID != "" {
+				inMission++
+				if s.Speed > 0.05 {
+					moving++
+				}
+			}
+		}
+	}
+	ratio := 0.0
+	if inMission > 0 {
+		ratio = float64(moving) / float64(inMission) * 100
+	}
+	t.Logf("%d vehicles: %d checks, completed=%d failed=%d avgDuration=%.0fs avgWait=%.0fs deadlocksResolved=%d moving=%.0f%% alarms=%d",
+		start.Vehicles, checks, k.MissionsCompleted, k.MissionsFailed, k.AvgMissionDurationS, k.AvgWaitTimeS, k.DeadlocksResolved, ratio, k.ActiveAlarms)
+	if k.MissionsCompleted < minCompleted {
+		t.Fatalf("fleet is not moving enough: %+v", k)
 	}
 }
 

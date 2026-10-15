@@ -12,6 +12,20 @@
 Chaque jalon livre une application exécutable (`make run-sim` / `docker compose up`), des
 tests automatisés (`make test`) et cette documentation.
 
+## Mesures de référence (simulation, `go test ./internal/fleet -run TestFleet`)
+
+| Scénario | Résultat (25 min simulées) |
+|---|---|
+| 1 AGV seul, carte démo 4×6 | ≈ 373 s par mission (référence « flux libre » : trajets de 250–350 m à 0,5–1 m/s, rotations à 0,2 rad/s, prise/dépose 8 s) |
+| 10 AGV, carte 4×6, 6 missions/min (saturation) | ≈ 680 s par mission, 43–58 % du temps en mouvement, aucun chevauchement de gabarits |
+| 14 AGV, carte 6×8, 8 missions/min | ≈ 730 s par mission, 55–62 % du temps en mouvement |
+
+Le test `TestFleetStressBodiesNeverOverlap` vérifie toutes les 100 ms qu'aucun corps de véhicule
+n'en chevauche un autre et qu'aucun nœud n'accueille deux véhicules arrêtés. Les pistes
+d'amélioration du débit en forte densité sont la planification coopérative (interface
+`Planner`), des réservations temporelles et une conception de carte à sens uniques (les
+allées bidirectionnelles de la carte démo génèrent des face-à-face).
+
 ## Limites connues de cette version
 
 - Les réservations sont spatiales (pas de réservation temporelle) ; l'interface `Planner`

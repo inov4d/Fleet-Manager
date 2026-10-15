@@ -568,6 +568,9 @@ func (a *Agent) moveToward(dt float64) bool {
 		a.arrive(n, target)
 		return true
 	}
+	// braking distance: look through straight, released, action-free nodes so
+	// the vehicle does not stop at every waypoint
+	brakeDist := dist + a.straightAhead(a.nodeIdx, dx/dist, dy/dist)
 	dirX, dirY := dx/dist, dy/dist
 	// body-frame direction decides forward vs lateral speed limit
 	bx := dirX*math.Cos(a.pose.Theta) + dirY*math.Sin(a.pose.Theta)
@@ -580,7 +583,7 @@ func (a *Agent) moveToward(dt float64) bool {
 	if v > lim {
 		v = lim
 	}
-	stop := math.Sqrt(2 * m.AccelMs2 * dist)
+	stop := math.Sqrt(2 * m.AccelMs2 * brakeDist)
 	if v > stop {
 		v = stop
 	}
@@ -609,6 +612,34 @@ func (a *Agent) moveToward(dt float64) bool {
 	return true
 }
 
+// straightAhead returns the length of the released, action-free, collinear
+// continuation after node index idx (0 when the vehicle must stop there).
+func (a *Agent) straightAhead(idx int, dirX, dirY float64) float64 {
+	total := 0.0
+	for i := idx; i+1 < len(a.order.Nodes); i++ {
+		cur, next := a.order.Nodes[i], a.order.Nodes[i+1]
+		if !next.Released || len(cur.Actions) > 0 || cur.NodePosition == nil || next.NodePosition == nil {
+			break
+		}
+		if cur.NodePosition.Theta != nil {
+			break // a required heading at this node implies a stop
+		}
+		if i < len(a.order.Edges) {
+			e := a.order.Edges[i]
+			if e.Orientation != nil && math.Abs(normAngle(*e.Orientation-a.pose.Theta)) > 0.01 {
+				break // rotation needed before the next edge
+			}
+		}
+		ex, ey := next.NodePosition.X-cur.NodePosition.X, next.NodePosition.Y-cur.NodePosition.Y
+		l := math.Hypot(ex, ey)
+		if l < 1e-6 || (ex*dirX+ey*dirY)/l < 0.999 {
+			break // not collinear
+		}
+		total += l
+	}
+	return total
+}
+
 func (a *Agent) arrive(n vda5050.Node, target core.Point) {
 	a.pose.X, a.pose.Y = target.X, target.Y
 	if n.NodePosition != nil && n.NodePosition.Theta != nil {
@@ -617,7 +648,9 @@ func (a *Agent) arrive(n vda5050.Node, target core.Point) {
 	a.lastNodeID = n.NodeID
 	a.lastNodeSeq = n.SequenceID
 	a.nodeIdx++
-	a.speed = 0
+	if len(n.Actions) > 0 || a.nodeIdx >= len(a.order.Nodes) || !a.order.Nodes[a.nodeIdx].Released {
+		a.speed = 0
+	}
 	a.nodeArrivedAt = a.simTime
 	a.startNodeActions(a.nodeIdx - 1)
 	a.dirty = true

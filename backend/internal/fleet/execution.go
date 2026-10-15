@@ -43,6 +43,27 @@ type execution struct {
 	isCharge         bool
 	isReturn         bool
 	lastOrderAt      time.Time
+	// yielding: after backing off, do not re-enter the contested area until
+	// the other vehicle has moved on (or the yield expires)
+	yieldTo       string
+	yieldFromNode string
+	yieldIdx      int
+	yieldUntil    time.Time
+	yieldPeers    []string // other vehicles of the deadlock cycle
+}
+
+// holdersMoving reports whether every holder of a denied resource is driving.
+func holdersMoving(c *Core, holders []string) bool {
+	if len(holders) == 0 {
+		return false
+	}
+	for _, h := range holders {
+		r := c.rt[h]
+		if r == nil || !r.state.Driving {
+			return false
+		}
+	}
+	return true
 }
 
 func appendUnique(list []string, items ...string) []string {
@@ -113,7 +134,7 @@ func (c *Core) planMission(g *mapmgr.Graph, m *core.Mission, start string, env c
 		}
 	}
 	req := planner.Request{Graph: g, Envelope: env, MassKg: mass, MaxSpeedMs: maxSpeed, AvoidZones: m.Constraints.AvoidZoneIDs, AvoidNodes: avoidNodes, AvoidEdges: avoidEdges,
-		Congestion: c.traffic.Congestion(m.SiteID)}
+		Congestion: c.traffic.Congestion(m.SiteID), DirectedCost: c.intentCost(m.SiteID, m.VehicleID)}
 	var route *planner.Route
 	var err error
 	if len(nodes) == 1 {
@@ -145,6 +166,56 @@ func (c *Core) planMission(g *mapmgr.Graph, m *core.Mission, start string, env c
 		}
 	}
 	return route, stepAt, nil
+}
+
+// intentCost returns a directed edge cost derived from the declared
+// intentions of the other vehicles (their next route segments): driving
+// against another vehicle's intent on a bidirectional edge is the classic
+// head-on standoff, so it is strongly discouraged; following in the same
+// direction costs a little.
+func (c *Core) intentCost(siteID, except string) func(edgeID, from, to string) float64 {
+	g := c.graphs[siteID]
+	if g == nil {
+		return nil
+	}
+	type intent struct{ fromTo, toFrom int } // traversals in each direction of the stored edge
+	intents := map[string]*intent{}
+	for vid, ex := range c.execs {
+		if vid == except || ex.siteID != siteID {
+			continue
+		}
+		for i := ex.routeIdx; i+1 < len(ex.route) && i < ex.routeIdx+6; i++ {
+			e := g.g.EdgeBetween(ex.route[i], ex.route[i+1])
+			if e == nil {
+				continue
+			}
+			it := intents[e.ID]
+			if it == nil {
+				it = &intent{}
+				intents[e.ID] = it
+			}
+			if e.From == ex.route[i] {
+				it.fromTo++
+			} else {
+				it.toFrom++
+			}
+		}
+	}
+	return func(edgeID, from, to string) float64 {
+		it := intents[edgeID]
+		if it == nil {
+			return 0
+		}
+		e := g.g.Edges[edgeID]
+		if e == nil {
+			return 0
+		}
+		same, opposite := it.fromTo, it.toFrom
+		if e.From != from { // traversing the edge backwards
+			same, opposite = it.toFrom, it.fromTo
+		}
+		return float64(same)*10 + float64(opposite)*80
+	}
 }
 
 // candidates builds dispatcher contexts for the vehicles of a site.
@@ -488,10 +559,27 @@ func (c *Core) stepExecution(vid string, now time.Time) {
 			granted = ex.stepAt[i]
 		}
 	}
+	// yielding after a back-off: hold at the back-off node until the peer moved
+	if ex.yieldTo != "" {
+		peer := c.rt[ex.yieldTo]
+		moved := peer == nil || peer.state.LastNodeID != ex.yieldFromNode || c.execs[ex.yieldTo] == nil
+		if moved || now.After(ex.yieldUntil) {
+			ex.yieldTo = ""
+		} else if granted > ex.yieldIdx && ex.yieldIdx >= ex.routeIdx {
+			granted = ex.yieldIdx
+		}
+	}
 	if res.Denied != nil && res.GrantedThrough <= ex.routeIdx {
 		if ex.waitingSince.IsZero() {
 			ex.waitingSince = now
-		} else if now.Sub(ex.waitingSince) > c.cfg.ReplanAfter && atBaseEnd {
+		}
+		// replan quickly when the holder stands still (it may wait on us or be
+		// parked), but give a moving holder time to clear the resource
+		patience := c.cfg.ReplanAfter
+		if holdersMoving(c, res.Denied.HeldBy) {
+			patience = 4 * c.cfg.ReplanAfter
+		}
+		if now.Sub(ex.waitingSince) > patience && atBaseEnd {
 			// accumulate what blocked us so successive replans route further away
 			switch res.Denied.Resource.Type {
 			case core.ResNode:
@@ -623,6 +711,19 @@ func (c *Core) replanExecution(vid string, m *core.Mission, cur string) bool {
 	if same {
 		return false
 	}
+	// a detour only pays off when it is not much longer than the remaining
+	// route (otherwise waiting for the resource to clear is cheaper)
+	if ex.deadlockID == "" {
+		remaining := 0.0
+		for i := ex.routeIdx; i+1 < len(ex.route); i++ {
+			if e := g.g.EdgeBetween(ex.route[i], ex.route[i+1]); e != nil {
+				remaining += g.g.Length(e)
+			}
+		}
+		if route.LengthM > 1.5*remaining+30 {
+			return false
+		}
+	}
 	c.traffic.ClearRoute(vid)
 	ex.route = route.NodeIDs
 	ex.routeIdx = 0
@@ -685,6 +786,16 @@ func (c *Core) handleDeadlock(res traffic.Resolution) {
 	ex.forcedAvoidEdges = append(ex.forcedAvoidEdges, res.AvoidEdges...)
 	ex.replanRequested = true
 	ex.deadlockID = res.DeadlockID
+	ex.yieldPeers = nil
+	for _, d := range c.traffic.Deadlocks(v.SiteID) {
+		if d.ID == res.DeadlockID {
+			for _, o := range d.VehicleIDs {
+				if o != res.VehicleID {
+					ex.yieldPeers = append(ex.yieldPeers, o)
+				}
+			}
+		}
+	}
 	// the replan itself happens in stepExecution once the vehicle stands still
 	// at the end of its released base (a new order must start where the
 	// vehicle is, never between two nodes)
@@ -711,6 +822,15 @@ func (c *Core) backoff(vid string, m *core.Mission, cur string) bool {
 	avoidN := append([]string{}, ex.forcedAvoidNodes...)
 	for n := range occupied {
 		avoidN = append(avoidN, n)
+	}
+	// stay off the next nodes of the vehicles we are yielding to
+	for _, oid := range ex.yieldPeers {
+		if oex := c.execs[oid]; oex != nil {
+			for i := oex.routeIdx; i < len(oex.route) && i < oex.routeIdx+4; i++ {
+				avoidN = append(avoidN, oex.route[i])
+				occupied[oex.route[i]] = true
+			}
+		}
 	}
 	skip := map[string]bool{}
 	for _, an := range avoidN {
@@ -746,6 +866,14 @@ func (c *Core) backoff(vid string, m *core.Mission, cur string) bool {
 	ex.route, ex.routeIdx, ex.stepAt = full, 0, stepAt
 	ex.orderID, ex.sentThrough = "", -1
 	ex.replans++
+	// yield: hold at the back-off node until the first peer has moved away
+	ex.yieldTo, ex.yieldFromNode, ex.yieldIdx, ex.yieldUntil = "", "", len(bestRoute)-1, c.clock.Now().Add(60*time.Second)
+	for _, oid := range ex.yieldPeers {
+		if orx := c.rt[oid]; orx != nil {
+			ex.yieldTo, ex.yieldFromNode = oid, orx.state.LastNodeID
+			break
+		}
+	}
 	_, _ = c.missions.Update(m.ID, func(mm *core.Mission) (string, error) {
 		mm.RouteNodeIDs = full
 		mm.History = append(mm.History, core.MissionEvent{At: c.clock.Now(), Status: mm.Status, Message: "backing off to " + best + " to resolve a deadlock"})
