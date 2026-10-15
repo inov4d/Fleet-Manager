@@ -27,6 +27,10 @@ type Arbiter interface {
 	Assignments(siteID string) []Assignment
 	ActiveMap(siteID string) (*core.Map, bool)
 	VehicleInfos(siteID string) []VehicleInfo
+	// Conflicts lists, per vehicle, the neighbour holding the resource it waits for.
+	Conflicts(siteID string) []Conflict
+	// Yield executes a negotiated concession (back-off, step aside) safely.
+	Yield(siteID string, y Yield) error
 }
 
 // BoardServer publishes the board and arbitrates claims.
@@ -45,6 +49,7 @@ type BoardServer struct {
 	history  []Grant
 	granted  int
 	rejected int
+	yields   []Yield
 }
 
 type claimWindow struct {
@@ -55,9 +60,11 @@ type claimWindow struct {
 
 // Stats are the board counters.
 type Stats struct {
-	Granted  int     `json:"granted"`
-	Rejected int     `json:"rejected"`
-	Recent   []Grant `json:"recent"`
+	Granted    int     `json:"granted"`
+	Rejected   int     `json:"rejected"`
+	Negotiated int     `json:"negotiated"`
+	Recent     []Grant `json:"recent"`
+	Yields     []Yield `json:"yields"`
 }
 
 // NewBoardServer creates the server. window is the wall-clock time during
@@ -82,6 +89,7 @@ func (b *BoardServer) Start(sites []string, publishEvery time.Duration) error {
 		"fleet/+/board/claims":   b.onClaim,
 		"fleet/+/board/requests": b.onRequest,
 		"fleet/+/board/releases": b.onRelease,
+		"fleet/+/board/yields":   b.onYield,
 	} {
 		u, err := b.tr.Subscribe(topic, h)
 		if err != nil {
@@ -187,7 +195,28 @@ func (b *BoardServer) PublishAll() {
 		for _, vi := range b.arb.VehicleInfos(site) {
 			b.publishIfChanged(TopicVehicle(site, vi.ID), vi, true)
 		}
+		for _, cf := range b.arb.Conflicts(site) {
+			b.publishIfChanged(TopicConflicts(site, cf.VehicleID), cf, true)
+		}
 	}
+}
+
+func (b *BoardServer) onYield(topic string, payload []byte) {
+	var y Yield
+	if err := json.Unmarshal(payload, &y); err != nil || y.VehicleID == "" || y.Beneficiary == "" {
+		return
+	}
+	if err := b.arb.Yield(siteOf(topic), y); err != nil {
+		b.log.Debug("negotiated yield not applicable", "vehicle", y.VehicleID, "err", err)
+		return
+	}
+	b.mu.Lock()
+	b.yields = append(b.yields, y)
+	if len(b.yields) > 100 {
+		b.yields = b.yields[len(b.yields)-100:]
+	}
+	b.mu.Unlock()
+	b.log.Info("negotiated right of way", "yields", y.VehicleID, "to", y.Beneficiary, "resource", y.Resource.Key())
 }
 
 func (b *BoardServer) onClaim(topic string, payload []byte) {
@@ -289,7 +318,14 @@ func (b *BoardServer) Stats() Stats {
 	if len(recent) > 50 {
 		recent = recent[len(recent)-50:]
 	}
-	return Stats{Granted: b.granted, Rejected: b.rejected, Recent: recent}
+	ys := append([]Yield(nil), b.yields...)
+	if len(ys) > 20 {
+		ys = ys[len(ys)-20:]
+	}
+	if ys == nil {
+		ys = []Yield{}
+	}
+	return Stats{Granted: b.granted, Rejected: b.rejected, Negotiated: len(b.yields), Recent: recent, Yields: ys}
 }
 
 var _ = context.Background

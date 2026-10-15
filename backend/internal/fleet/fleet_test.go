@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/inov4d/fleet-manager/internal/colony"
 	"github.com/inov4d/fleet-manager/internal/core"
 	"github.com/inov4d/fleet-manager/internal/store"
 	"github.com/inov4d/fleet-manager/internal/transport"
@@ -238,5 +239,72 @@ func TestColonyModeClaimsAndCompletes(t *testing.T) {
 	st := c.Colony("")
 	if st.Mode != core.AllocationColony || len(st.Agents) != 3 || st.Stats.Granted < 2 {
 		t.Fatalf("colony status %+v", st.Stats)
+	}
+}
+
+func TestNegotiatedYieldExecutedByCore(t *testing.T) {
+	c := newCore(t)
+	ds := c.DispatcherSettings()
+	ds.Mode = core.AllocationColony
+	_ = c.SetDispatcherSettings(ds)
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Stop()
+	if _, err := c.StartSimulation(SimulationStart{Vehicles: 2, TimeScale: 20, ModelMix: map[string]float64{"AGV20T": 1}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "vehicles available", func() bool {
+		n := 0
+		for _, v := range c.Vehicles("") {
+			if v.State.Availability == core.AvailAvailable {
+				n++
+			}
+		}
+		return n == 2
+	})
+	vs := c.Vehicles("")
+	a, b := vs[0].Vehicle.ID, vs[1].Vehicle.ID
+	// b is idle: a negotiated yield makes it step aside off a's path
+	m, err := c.CreateMission(core.Mission{Destination: "PICK3", Priority: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 15*time.Second, "a claims the mission", func() bool {
+		mm, _ := c.Missions().Get(m.ID)
+		return mm.Status == core.MissionExecuting
+	})
+	mm, _ := c.Missions().Get(m.ID)
+	if mm.VehicleID != a {
+		a, b = b, a
+	}
+	arb := (*arbiter)(c)
+	if err := arb.Yield(core.DefaultSiteID, colony.Yield{VehicleID: b, Beneficiary: a, Resource: core.ResourceRef{Type: core.ResNode, ID: "N00"}, MyCost: 0, PeerCost: 15}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 15*time.Second, "idle yielder gets a step-aside mission", func() bool {
+		for _, ms := range c.Missions().List("", "", b, 0, true) {
+			if ms.Type == core.MissionManual && strings.Contains(ms.Name, "Pas de côté") {
+				return true
+			}
+		}
+		return false
+	})
+	// a working yielder records the concession and replans / backs off
+	if err := arb.Yield(core.DefaultSiteID, colony.Yield{VehicleID: a, Beneficiary: b, Resource: core.ResourceRef{Type: core.ResNode, ID: "N01"}, MyCost: 12, PeerCost: 30}); err != nil {
+		t.Fatal(err)
+	}
+	mm, _ = c.Missions().Get(m.ID)
+	found := false
+	for _, h := range mm.History {
+		if strings.Contains(h.Message, "yields to "+b) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("history should record the negotiated yield: %+v", mm.History)
+	}
+	if st := c.Colony(""); len(st.Agents) != 2 {
+		t.Fatalf("agents %d", len(st.Agents))
 	}
 }

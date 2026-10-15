@@ -22,7 +22,7 @@ export function ColonyPanel() {
     <Card>
       <CardHeader
         title="Tableau de la colonie"
-        subtitle={d.mode === "colony" ? `${d.tasks.length} tâche(s) ouvertes · ${d.stats.granted} revendications accordées · ${d.stats.rejected} refusées` : "Mode central actif : le tableau est vide, le répartiteur affecte les missions."}
+        subtitle={d.mode === "colony" ? `${d.tasks.length} tâche(s) ouvertes · ${d.stats.granted} revendications accordées · ${d.stats.rejected} refusées · ${d.stats.negotiated} cessions de passage négociées` : "Mode central actif : le tableau est vide, le répartiteur affecte les missions."}
       />
       <CardBody className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div>
@@ -52,7 +52,7 @@ export function ColonyPanel() {
             <p className="text-sm text-muted">Aucun agent en cours dans ce processus (les AGV réels exécutent <code>agvagent</code> à bord).</p>
           ) : (
             <table className="w-full text-sm">
-              <thead><tr className="text-left text-muted"><th>Véhicule</th><th>État</th><th>Batterie</th><th>Nœud</th><th>Revend. / gagnées</th></tr></thead>
+              <thead><tr className="text-left text-muted"><th>Véhicule</th><th>État</th><th>Batterie</th><th>Nœud</th><th>Revend. / gagnées</th><th>Cédé / passé</th></tr></thead>
               <tbody>
                 {d.agents.map((a) => (
                   <tr key={a.vehicleId} className="border-t border-border">
@@ -61,10 +61,23 @@ export function ColonyPanel() {
                     <td>{Math.round(a.battery)} %</td>
                     <td>{a.node || "—"}</td>
                     <td>{a.claims} / {a.wins}</td>
+                    <td>{a.yielded} / {a.passed}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
+          )}
+          {d.stats.yields.length > 0 && (
+            <div className="mt-3">
+              <h4 className="text-sm font-medium mb-1">Cessions de passage négociées entre voisins</h4>
+              <ul className="text-xs text-muted space-y-1">
+                {d.stats.yields.slice(-6).reverse().map((y) => (
+                  <li key={y.nonce + y.vehicleId}>
+                    <span className="text-warning">{y.vehicleId}</span> cède {y.resource.type} {y.resource.id} à {y.beneficiary} (coûts {y.myCost.toFixed(1)} vs {y.peerCost.toFixed(1)})
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
           {d.stats.recent.length > 0 && (
             <div className="mt-3">

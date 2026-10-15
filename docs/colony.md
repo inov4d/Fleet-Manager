@@ -48,10 +48,38 @@ dans le processus `fleetd`.
 | `fleet/<site>/board/assignments/<vehicleId>` (retenu) | centre → agent | `{"vehicleId","taskId","status":"idle"\|"assigned"\|"executing","ts"}` |
 | `fleet/<site>/map` (retenu) | centre → agents | carte active (même JSON que l'API) |
 | `fleet/<site>/vehicles/<vehicleId>` (retenu) | centre → agent | `{"id","siteId","modelId","model":{…},"enabled"}` |
+| `fleet/<site>/board/conflicts/<vehicleId>` (retenu) | centre → agent | `{"vehicleId","resource":{type,id},"heldBy":[],"since","active"}` |
+| `fleet/<site>/agents/<vehicleId>/inbox` | agent → agent | `Proposal {"nonce","from","to","resource","yieldCost","waitedS","at"}` ou `Answer {"nonce","from","to","yieldCost","iYield"}` |
+| `fleet/<site>/board/yields` | agent → centre | `{"nonce","vehicleId","beneficiary","resource","myCost","peerCost","reason","at"}` |
 
 L'agent lit sa propre position sur le topic VDA 5050 `state` de son contrôleur. Toute
 implémentation respectant ces messages (Python, ROS 2, automate…) peut remplacer l'agent de
 référence : le centre ne suppose rien de son intelligence.
+
+## Négociation locale des cessions de passage
+
+Quand un agent attend une ressource (nœud, arête, zone) tenue par un voisin, le centre lui
+publie seulement *qui* le bloque (`fleet/<site>/board/conflicts/<vehicleId>`, retenu). Les
+deux agents règlent alors le conflit **entre eux**, pair à pair :
+
+1. Après `NegotiateAfter` (4 s) d'attente, l'agent bloqué envoie une **proposition** dans la
+   boîte du voisin (`fleet/<site>/agents/<vehicleId>/inbox`) avec son propre **coût de cession** :
+   `0` s'il est inactif ; sinon `10 + urgence de sa tâche + 20 si une charge est à bord`, minoré
+   par le temps déjà attendu (un agent qui a longtemps attendu cède moins volontiers).
+2. Le voisin répond avec son propre coût. Les deux appliquent la **même règle déterministe**
+   (`DecideYield`) : le moins coûteux cède, égalité tranchée par l'identifiant. Aucun arbitre
+   n'est nécessaire ; chacun journalise la négociation (`negotiations` dans son instantané).
+3. Celui qui cède publie la concession sur `fleet/<site>/board/yields`. Le centre l'exécute en
+   sécurité : un agent au travail recule ou se replanifie en évitant le chemin du bénéficiaire
+   (mécanisme de repli existant, réservations toujours vérifiées) ; un agent inactif reçoit une
+   mission « pas de côté » vers le nœud libre le plus proche hors du chemin du bénéficiaire.
+4. En mode colonie, le centre **laisse 30 s** à la négociation locale avant d'appliquer sa
+   propre résolution d'interblocage ; une cession négociée clôt l'interblocage correspondant
+   (« negotiated: X gives way to Y »). Un voisin qui n'est pas un agent (ou injoignable) ne
+   répond pas : la proposition expire en 3 s et le centre reprend la main au bout des 30 s.
+
+Les cessions apparaissent dans l'onglet Répartiteur (« Cessions de passage négociées ») et
+dans `GET /colony/board` (`stats.negotiated`, `stats.yields`, `agents[].negotiations`).
 
 ## Arbitrage et sécurité
 
@@ -64,9 +92,9 @@ référence : le centre ne suppose rien de son intelligence.
   communication), elle revient sur le tableau.
 - L'explication d'affectation de la mission liste les revendications concurrentes et le coût
   gagnant (`assignment.candidates`), et l'historique note « claimed by … on the colony board ».
-- Le trafic, les interblocages, les pertes de communication et la garde sur la charge à bord
-  restent gérés par le centre : la décentralisation porte sur le **choix des tâches**, pas sur
-  la sécurité de l'espace partagé.
+- Le trafic, les pertes de communication et la garde sur la charge à bord restent gérés par le
+  centre : la décentralisation porte sur le **choix des tâches** et sur **qui cède le passage**,
+  pas sur la sécurité de l'espace partagé (les réservations restent l'autorité unique).
 
 ## Déploiement sur un AGV réel
 

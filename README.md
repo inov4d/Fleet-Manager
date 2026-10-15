@@ -34,7 +34,8 @@ Ou tout-en-un : `cp deploy/.env.example deploy/.env && make up` puis http://loca
   automatique si une charge peut être à bord).
 - **Mode colonie (fourmilière)** : tableau de tâches partagé et agent autonome open source
   embarqué sur chaque AGV (`agvagent`) qui revendique la tâche la plus opportune selon ses
-  règles locales ; le centre arbitre et vérifie seulement ([docs/colony.md](docs/colony.md)).
+  règles locales et **négocie les cessions de passage avec ses voisins** ; le centre arbitre,
+  vérifie et exécute en sécurité ([docs/colony.md](docs/colony.md)).
 - **Gestion du trafic** : réservations nœud/arête/zone, enveloppes balayées des manœuvres
   omnidirectionnelles (charge, débordement, marges, incertitude de localisation), couloirs
   à sens unique, croisements, zones d'attente, détection de blocages et d'**interblocages**

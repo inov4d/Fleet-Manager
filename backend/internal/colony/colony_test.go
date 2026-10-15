@@ -2,6 +2,8 @@ package colony
 
 import (
 	"encoding/json"
+	"log/slog"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -14,13 +16,15 @@ import (
 
 // fakeArbiter is a minimal board back-end.
 type fakeArbiter struct {
-	mu       sync.Mutex
-	tasks    []Task
-	granted  map[string]string // task -> vehicle
-	requests []Request
-	m        *core.Map
-	infos    []VehicleInfo
-	busy     map[string]bool
+	mu        sync.Mutex
+	tasks     []Task
+	granted   map[string]string // task -> vehicle
+	requests  []Request
+	m         *core.Map
+	infos     []VehicleInfo
+	busy      map[string]bool
+	conflicts []Conflict
+	yields    []Yield
 }
 
 func (f *fakeArbiter) OpenTasks(string) []Task {
@@ -76,7 +80,18 @@ func (f *fakeArbiter) Assignments(string) []Assignment {
 	return out
 }
 func (f *fakeArbiter) ActiveMap(string) (*core.Map, bool) { return f.m, true }
-func (f *fakeArbiter) VehicleInfos(string) []VehicleInfo  { return f.infos }
+func (f *fakeArbiter) Conflicts(string) []Conflict {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]Conflict(nil), f.conflicts...)
+}
+func (f *fakeArbiter) Yield(_ string, y Yield) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.yields = append(f.yields, y)
+	return nil
+}
+func (f *fakeArbiter) VehicleInfos(string) []VehicleInfo { return f.infos }
 
 func stateMsg(serial, node string, x, y, battery float64) []byte {
 	s := vda5050.State{Header: vda5050.Header{HeaderID: 1, Version: vda5050.Version, Manufacturer: "m", SerialNumber: serial}, OperatingMode: vda5050.OpAutomatic,
@@ -187,4 +202,62 @@ func TestAgentRequestsChargeWhenLow(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("no charge request")
+}
+
+// TestLocalNegotiationIdleNeighbourYields: v1 executes a task and waits behind
+// v2, which is idle. v1 proposes; v2 answers with a lower yield cost and gives
+// way; the board receives the agreed Yield.
+func TestLocalNegotiationIdleNeighbourYields(t *testing.T) {
+	bus := transport.NewMemory()
+	model := core.BuiltinModels()[0]
+	arb := &fakeArbiter{granted: map[string]string{"t1": "v1"}, busy: map[string]bool{"v1": true}, m: mapmgr.DemoMap("s"),
+		infos:     []VehicleInfo{{ID: "v1", SiteID: "s", ModelID: "AGV20T", Model: model, Enabled: true}, {ID: "v2", SiteID: "s", ModelID: "AGV20T", Model: model, Enabled: true}},
+		conflicts: []Conflict{{VehicleID: "v1", Resource: core.ResourceRef{Type: core.ResNode, ID: "N01"}, HeldBy: []string{"v2"}, Since: time.Now().Add(-10 * time.Second), Active: true}, {VehicleID: "v2"}}}
+	board := NewBoardServer(bus, arb, nil, 100*time.Millisecond)
+	_ = board.Start([]string{"s"}, 100*time.Millisecond)
+	defer board.Stop()
+	dbg := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	mk := func(id, serial string) *Agent {
+		a := NewAgent(AgentConfig{SiteID: "s", VehicleID: id, Manufacturer: "m", Serial: serial, NegotiateAfter: 300 * time.Millisecond}, bus, dbg)
+		if err := a.Start(); err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	v1, v2 := mk("v1", "s1"), mk("v2", "s2")
+	defer v1.Stop()
+	defer v2.Stop()
+	_ = bus.Publish(vda5050.Topic("uagv", "m", "s1", vda5050.TopicState), stateMsg("s1", "N00", 10, 10, 90), false)
+	_ = bus.Publish(vda5050.Topic("uagv", "m", "s2", vda5050.TopicState), stateMsg("s2", "N01", 40, 10, 90), false)
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		arb.mu.Lock()
+		n := len(arb.yields)
+		arb.mu.Unlock()
+		if n > 0 {
+			y := arb.yields[0]
+			if y.VehicleID != "v2" || y.Beneficiary != "v1" || y.Resource.ID != "N01" {
+				t.Fatalf("unexpected yield %+v", y)
+			}
+			s1, s2 := v1.Snapshot(), v2.Snapshot()
+			if s2.Yielded != 1 || s1.Passed != 1 || len(s1.Negotiations) != 1 || s1.Negotiations[0].IYield {
+				t.Fatalf("snapshots v1=%+v v2=%+v", s1, s2)
+			}
+			if st := board.Stats(); st.Negotiated != 1 {
+				t.Fatalf("board stats %+v", st)
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("no negotiated yield")
+}
+
+func TestDecideYieldIsSymmetric(t *testing.T) {
+	if !DecideYield("a", 1, "b", 5) || DecideYield("b", 5, "a", 1) {
+		t.Fatal("cheaper side must yield")
+	}
+	if !DecideYield("a", 3, "b", 3) || DecideYield("b", 3, "a", 3) {
+		t.Fatal("ties must be broken consistently")
+	}
 }

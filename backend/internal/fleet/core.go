@@ -93,21 +93,22 @@ type Core struct {
 	analytics *analytics.Engine
 	simEngine *sim.Engine
 
-	mu       sync.RWMutex
-	sites    map[string]*core.Site
-	models   map[string]*core.VehicleModel
-	vehicles map[string]*core.Vehicle
-	rt       map[string]*vehicleRuntime
-	graphs   map[string]*graphEntry
-	execs    map[string]*execution
-	dispatch core.DispatcherSettings
-	battery  core.BatterySettings
-	simState simulationState
-	whMu     sync.RWMutex
-	webhooks []core.Webhook
-	pins     map[string]pin // mission id -> forced assignment
-	board    *colony.BoardServer
-	agents   map[string]*colony.Agent // in-process agents of simulated vehicles
+	mu               sync.RWMutex
+	sites            map[string]*core.Site
+	models           map[string]*core.VehicleModel
+	vehicles         map[string]*core.Vehicle
+	rt               map[string]*vehicleRuntime
+	graphs           map[string]*graphEntry
+	execs            map[string]*execution
+	dispatch         core.DispatcherSettings
+	battery          core.BatterySettings
+	simState         simulationState
+	whMu             sync.RWMutex
+	webhooks         []core.Webhook
+	pins             map[string]pin // mission id -> forced assignment
+	board            *colony.BoardServer
+	agents           map[string]*colony.Agent // in-process agents of simulated vehicles
+	pendingDeadlocks map[string]pendingDeadlock
 
 	subsMu       sync.Mutex
 	subs         map[int]func(core.Event)
@@ -404,10 +405,11 @@ func (c *Core) Tick() {
 	for id := range c.execs {
 		c.stepExecution(id, now)
 	}
-	// 4. deadlocks
+	// 4. deadlocks (in colony mode the neighbours negotiate first)
 	for _, res := range c.traffic.DetectDeadlocks() {
 		c.handleDeadlock(res)
 	}
+	c.expireNegotiations(now)
 	// 5. blocked vehicles
 	c.handleBlocked(now)
 	// 6. dispatch, charging, parking

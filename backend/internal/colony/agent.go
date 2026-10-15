@@ -32,18 +32,33 @@ type AgentConfig struct {
 	MinClaimDelay      time.Duration
 	MaxClaimDelay      time.Duration
 	ParkAfterIdle      time.Duration
+	// NegotiateAfter is how long an agent waits behind a neighbour before
+	// proposing a negotiation; NegotiateCooldown spaces negotiations per peer.
+	NegotiateAfter    time.Duration
+	NegotiateCooldown time.Duration
 }
 
 // DefaultAgentConfig returns the reference thresholds.
 func DefaultAgentConfig() AgentConfig {
 	return AgentConfig{Interface: vda5050.DefaultInterface, LowBatteryPct: 30, CriticalBatteryPct: 15, ReserveBatteryPct: 10,
-		ClaimScale: 0.02, MinClaimDelay: 100 * time.Millisecond, MaxClaimDelay: 3 * time.Second, ParkAfterIdle: 3 * time.Minute}
+		ClaimScale: 0.02, MinClaimDelay: 100 * time.Millisecond, MaxClaimDelay: 3 * time.Second, ParkAfterIdle: 3 * time.Minute,
+		NegotiateAfter: 4 * time.Second, NegotiateCooldown: 20 * time.Second}
 }
 
 // Publisher is the minimal transport the agent needs (satisfied by transport.Transport).
 type Publisher interface {
 	Publish(topic string, payload []byte, retain bool) error
 	Subscribe(filter string, h transport.Handler) (func(), error)
+}
+
+// Negotiation is a logged right-of-way exchange (for explainability).
+type Negotiation struct {
+	Peer     string    `json:"peer"`
+	Resource string    `json:"resource"`
+	MyCost   float64   `json:"myCost"`
+	PeerCost float64   `json:"peerCost"`
+	IYield   bool      `json:"iYield"`
+	At       time.Time `json:"at"`
 }
 
 // Decision is a logged evaluation of a task (for explainability).
@@ -80,13 +95,22 @@ type Agent struct {
 	claimedTask string
 	ticker      *time.Ticker
 	stopCh      chan struct{}
-	lastCharge  time.Time
-	lastPark    time.Time
-	idleSince   time.Time
-	decisions   []Decision
-	unsubs      []func()
-	claims      int
-	wins        int
+	myTask      *Task // the task currently claimed / executed (for the yield cost)
+	// negotiation
+	conflict     *Conflict
+	conflictSeen time.Time
+	openProposal *Proposal
+	lastTalk     map[string]time.Time
+	negotiations []Negotiation
+	yielded      int
+	passed       int
+	lastCharge   time.Time
+	lastPark     time.Time
+	idleSince    time.Time
+	decisions    []Decision
+	unsubs       []func()
+	claims       int
+	wins         int
 }
 
 // NewAgent creates an agent.
@@ -116,21 +140,29 @@ func NewAgent(cfg AgentConfig, tr Publisher, log *slog.Logger) *Agent {
 	if cfg.ParkAfterIdle <= 0 {
 		cfg.ParkAfterIdle = d.ParkAfterIdle
 	}
+	if cfg.NegotiateAfter <= 0 {
+		cfg.NegotiateAfter = d.NegotiateAfter
+	}
+	if cfg.NegotiateCooldown <= 0 {
+		cfg.NegotiateCooldown = d.NegotiateCooldown
+	}
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Agent{cfg: cfg, tr: tr, log: log.With("agent", cfg.VehicleID), idleSince: time.Now()}
+	return &Agent{cfg: cfg, tr: tr, log: log.With("agent", cfg.VehicleID), idleSince: time.Now(), lastTalk: map[string]time.Time{}}
 }
 
 // Start subscribes to the board, the map, the registry and the vehicle's own state.
 func (a *Agent) Start() error {
 	c := a.cfg
 	subs := map[string]transport.Handler{
-		TopicTasks(c.SiteID):                    a.onTasks,
-		TopicGrants(c.SiteID, c.VehicleID):      a.onGrant,
-		TopicAssignments(c.SiteID, c.VehicleID): a.onAssignment,
-		TopicMap(c.SiteID):                      a.onMap,
-		TopicVehicle(c.SiteID, c.VehicleID):     a.onVehicleInfo,
+		TopicTasks(c.SiteID):                                                     a.onTasks,
+		TopicGrants(c.SiteID, c.VehicleID):                                       a.onGrant,
+		TopicAssignments(c.SiteID, c.VehicleID):                                  a.onAssignment,
+		TopicMap(c.SiteID):                                                       a.onMap,
+		TopicVehicle(c.SiteID, c.VehicleID):                                      a.onVehicleInfo,
+		TopicConflicts(c.SiteID, c.VehicleID):                                    a.onConflict,
+		TopicInbox(c.SiteID, c.VehicleID):                                        a.onInbox,
 		vda5050.Topic(c.Interface, c.Manufacturer, c.Serial, vda5050.TopicState): a.onState,
 	}
 	for topic, h := range subs {
@@ -151,6 +183,7 @@ func (a *Agent) Start() error {
 				return
 			case <-a.ticker.C:
 				a.evaluate()
+				a.negotiate()
 			}
 		}
 	}()
@@ -234,6 +267,7 @@ func (a *Agent) onAssignment(_ string, p []byte) {
 	if as.Status == "idle" && prev.Status != "idle" {
 		a.idleSince = time.Now()
 		a.claimedTask = ""
+		a.myTask = nil
 	}
 	a.mu.Unlock()
 	a.evaluate()
@@ -253,6 +287,12 @@ func (a *Agent) onGrant(_ string, p []byte) {
 	if g.Granted {
 		a.wins++
 		a.claimedTask = g.TaskID
+		for i := range a.tasks {
+			if a.tasks[i].ID == g.TaskID {
+				t := a.tasks[i]
+				a.myTask = &t
+			}
+		}
 		a.log.Info("task won", "task", g.TaskID, "competing", g.Competing)
 	} else {
 		a.log.Debug("claim refused", "task", g.TaskID, "reason", g.Reason)
@@ -476,13 +516,16 @@ func (a *Agent) GiveBack(reason string) {
 
 // Snapshot describes the agent for diagnostics.
 type Snapshot struct {
-	VehicleID  string     `json:"vehicleId"`
-	Battery    float64    `json:"battery"`
-	Node       string     `json:"node"`
-	Assignment Assignment `json:"assignment"`
-	Claims     int        `json:"claims"`
-	Wins       int        `json:"wins"`
-	Decisions  []Decision `json:"decisions"`
+	VehicleID    string        `json:"vehicleId"`
+	Battery      float64       `json:"battery"`
+	Node         string        `json:"node"`
+	Assignment   Assignment    `json:"assignment"`
+	Claims       int           `json:"claims"`
+	Wins         int           `json:"wins"`
+	Decisions    []Decision    `json:"decisions"`
+	Yielded      int           `json:"yielded"`
+	Passed       int           `json:"passed"`
+	Negotiations []Negotiation `json:"negotiations"`
 }
 
 // Snapshot returns the current view of the agent.
@@ -491,5 +534,158 @@ func (a *Agent) Snapshot() Snapshot {
 	defer a.mu.Unlock()
 	ds := append([]Decision(nil), a.decisions...)
 	sort.Slice(ds, func(i, j int) bool { return ds[i].Delay < ds[j].Delay })
-	return Snapshot{VehicleID: a.cfg.VehicleID, Battery: a.battery, Node: a.currentNode(), Assignment: a.assignment, Claims: a.claims, Wins: a.wins, Decisions: ds}
+	ng := append([]Negotiation(nil), a.negotiations...)
+	if ng == nil {
+		ng = []Negotiation{}
+	}
+	return Snapshot{VehicleID: a.cfg.VehicleID, Battery: a.battery, Node: a.currentNode(), Assignment: a.assignment, Claims: a.claims, Wins: a.wins, Decisions: ds,
+		Yielded: a.yielded, Passed: a.passed, Negotiations: ng}
+}
+
+// ---------------------------------------------------------------------------
+// Local negotiation of right of way
+
+func (a *Agent) onConflict(_ string, p []byte) {
+	var cf Conflict
+	if json.Unmarshal(p, &cf) != nil {
+		return
+	}
+	a.mu.Lock()
+	if !cf.Active || len(cf.HeldBy) == 0 {
+		a.conflict = nil
+	} else if a.conflict == nil || a.conflict.Resource.Key() != cf.Resource.Key() {
+		a.conflict = &cf
+		a.conflictSeen = time.Now()
+	}
+	a.mu.Unlock()
+	a.negotiate()
+}
+
+// yieldCost is the agent's own price for giving way: an idle vehicle yields for
+// free; a working one weighs its task's urgency and its load; waiting a long
+// time makes an agent less willing to yield again.
+func (a *Agent) yieldCost() float64 {
+	cost := 0.0
+	if a.assignment.Status == "executing" || a.assignment.Status == "assigned" || a.claimedTask != "" {
+		cost = 10
+		if a.myTask != nil {
+			cost += a.myTask.Urgency
+		}
+		if a.loadPresent {
+			cost += 20
+		}
+	}
+	if a.conflict != nil {
+		waited := time.Since(a.conflictSeen).Seconds()
+		cost += math.Min(waited, 60) / 3
+	}
+	return cost
+}
+
+// negotiate opens a proposal towards the neighbour that blocks us.
+func (a *Agent) negotiate() {
+	a.mu.Lock()
+	cf := a.conflict
+	if cf == nil || a.openProposal != nil || time.Since(a.conflictSeen) < a.cfg.NegotiateAfter {
+		a.mu.Unlock()
+		return
+	}
+	peer := cf.HeldBy[0]
+	if last, ok := a.lastTalk[peer]; ok && time.Since(last) < a.cfg.NegotiateCooldown {
+		a.mu.Unlock()
+		return
+	}
+	a.lastTalk[peer] = time.Now()
+	pr := Proposal{Nonce: uuid.NewString(), From: a.cfg.VehicleID, To: peer, Resource: cf.Resource, YieldCost: a.yieldCost(), WaitedS: time.Since(a.conflictSeen).Seconds(), At: time.Now().UTC()}
+	a.openProposal = &pr
+	nonce := pr.Nonce
+	time.AfterFunc(3*time.Second, func() {
+		a.mu.Lock()
+		if a.openProposal != nil && a.openProposal.Nonce == nonce {
+			a.openProposal = nil // no answer: the peer is not an agent (or is unreachable)
+		}
+		a.mu.Unlock()
+	})
+	a.mu.Unlock()
+	payload, _ := json.Marshal(pr)
+	_ = a.tr.Publish(TopicInbox(a.cfg.SiteID, peer), payload, false)
+	a.log.Debug("negotiation proposed", "to", peer, "resource", cf.Resource.Key(), "myCost", pr.YieldCost)
+}
+
+func (a *Agent) onInbox(_ string, p []byte) {
+	var probe struct {
+		Nonce  string  `json:"nonce"`
+		From   string  `json:"from"`
+		IYield *bool   `json:"iYield"`
+		Cost   float64 `json:"yieldCost"`
+	}
+	if json.Unmarshal(p, &probe) != nil || probe.From == "" {
+		return
+	}
+	if probe.IYield != nil {
+		var ans Answer
+		if json.Unmarshal(p, &ans) == nil {
+			a.onAnswer(ans)
+		}
+		return
+	}
+	var pr Proposal
+	if json.Unmarshal(p, &pr) == nil {
+		a.onProposal(pr)
+	}
+}
+
+// onProposal answers with our own cost and applies the shared rule.
+func (a *Agent) onProposal(pr Proposal) {
+	a.mu.Lock()
+	my := a.yieldCost()
+	iYield := DecideYield(a.cfg.VehicleID, my, pr.From, pr.YieldCost)
+	a.lastTalk[pr.From] = time.Now()
+	a.negotiations = append(a.negotiations, Negotiation{Peer: pr.From, Resource: pr.Resource.Key(), MyCost: my, PeerCost: pr.YieldCost, IYield: iYield, At: time.Now().UTC()})
+	if len(a.negotiations) > 20 {
+		a.negotiations = a.negotiations[len(a.negotiations)-20:]
+	}
+	a.mu.Unlock()
+	ans := Answer{Nonce: pr.Nonce, From: a.cfg.VehicleID, To: pr.From, YieldCost: my, IYield: iYield}
+	payload, _ := json.Marshal(ans)
+	_ = a.tr.Publish(TopicInbox(a.cfg.SiteID, pr.From), payload, false)
+	if iYield {
+		a.publishYield(pr.Nonce, pr.From, pr.Resource, my, pr.YieldCost)
+	}
+}
+
+// onAnswer completes our own proposal.
+func (a *Agent) onAnswer(ans Answer) {
+	a.mu.Lock()
+	if a.openProposal == nil || a.openProposal.Nonce != ans.Nonce {
+		a.mu.Unlock()
+		return
+	}
+	pr := *a.openProposal
+	a.openProposal = nil
+	iYield := DecideYield(a.cfg.VehicleID, pr.YieldCost, ans.From, ans.YieldCost)
+	a.negotiations = append(a.negotiations, Negotiation{Peer: ans.From, Resource: pr.Resource.Key(), MyCost: pr.YieldCost, PeerCost: ans.YieldCost, IYield: iYield, At: time.Now().UTC()})
+	if len(a.negotiations) > 20 {
+		a.negotiations = a.negotiations[len(a.negotiations)-20:]
+	}
+	a.mu.Unlock()
+	if iYield {
+		a.publishYield(pr.Nonce, ans.From, pr.Resource, pr.YieldCost, ans.YieldCost)
+	} else {
+		a.mu.Lock()
+		a.passed++
+		a.mu.Unlock()
+	}
+}
+
+func (a *Agent) publishYield(nonce, beneficiary string, res core.ResourceRef, my, peer float64) {
+	a.mu.Lock()
+	a.yielded++
+	a.conflict = nil
+	a.mu.Unlock()
+	y := Yield{Nonce: nonce, VehicleID: a.cfg.VehicleID, Beneficiary: beneficiary, Resource: res, MyCost: my, PeerCost: peer,
+		Reason: fmt.Sprintf("negotiated: my yield cost %.1f < %.1f", my, peer), At: time.Now().UTC()}
+	payload, _ := json.Marshal(y)
+	_ = a.tr.Publish(TopicYields(a.cfg.SiteID), payload, false)
+	a.log.Info("giving way", "to", beneficiary, "resource", res.Key(), "myCost", my, "peerCost", peer)
 }

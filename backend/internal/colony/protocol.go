@@ -15,6 +15,12 @@
 //	fleet/<site>/board/assignments/<vid> retained board -> agent   Assignment (what the vehicle is doing)
 //	fleet/<site>/map                    retained  board -> agents  active map (agents plan locally)
 //	fleet/<site>/vehicles/<vid>         retained  board -> agent   VehicleInfo (model, capacity)
+//
+// Local negotiation of right of way between neighbouring agents:
+//
+//	fleet/<site>/board/conflicts/<vid>  retained  board -> agent   Conflict (who blocks me, since when)
+//	fleet/<site>/agents/<vid>/inbox               agent -> agent   Proposal / Answer (peer to peer)
+//	fleet/<site>/board/yields                     agent -> board   Yield (the agreed concession)
 package colony
 
 import (
@@ -106,3 +112,58 @@ func TopicReleases(site string) string         { return "fleet/" + site + "/boar
 func TopicAssignments(site, vid string) string { return "fleet/" + site + "/board/assignments/" + vid }
 func TopicMap(site string) string              { return "fleet/" + site + "/map" }
 func TopicVehicle(site, vid string) string     { return "fleet/" + site + "/vehicles/" + vid }
+
+// Conflict tells an agent which neighbour holds the resource it waits for.
+type Conflict struct {
+	VehicleID string           `json:"vehicleId"`
+	Resource  core.ResourceRef `json:"resource"`
+	HeldBy    []string         `json:"heldBy"`
+	Since     time.Time        `json:"since"`
+	Active    bool             `json:"active"`
+}
+
+// Proposal opens a negotiation: "one of us must give way, here is my cost of yielding".
+type Proposal struct {
+	Nonce     string           `json:"nonce"`
+	From      string           `json:"from"`
+	To        string           `json:"to"`
+	Resource  core.ResourceRef `json:"resource"`
+	YieldCost float64          `json:"yieldCost"`
+	WaitedS   float64          `json:"waitedS"`
+	At        time.Time        `json:"at"`
+}
+
+// Answer closes a negotiation with the peer's own cost; both sides apply the
+// same deterministic rule, so they agree on who yields without a referee.
+type Answer struct {
+	Nonce     string  `json:"nonce"`
+	From      string  `json:"from"`
+	To        string  `json:"to"`
+	YieldCost float64 `json:"yieldCost"`
+	IYield    bool    `json:"iYield"`
+}
+
+// Yield is the agreed concession, sent to the board which executes it safely.
+type Yield struct {
+	Nonce       string           `json:"nonce"`
+	VehicleID   string           `json:"vehicleId"`   // the one giving way
+	Beneficiary string           `json:"beneficiary"` // the one allowed through
+	Resource    core.ResourceRef `json:"resource"`
+	MyCost      float64          `json:"myCost"`
+	PeerCost    float64          `json:"peerCost"`
+	Reason      string           `json:"reason"`
+	At          time.Time        `json:"at"`
+}
+
+func TopicConflicts(site, vid string) string { return "fleet/" + site + "/board/conflicts/" + vid }
+func TopicInbox(site, vid string) string     { return "fleet/" + site + "/agents/" + vid + "/inbox" }
+func TopicYields(site string) string         { return "fleet/" + site + "/board/yields" }
+
+// DecideYield applies the shared rule: the cheaper side yields; ties go to the
+// lexicographically smaller vehicle id. It returns true when "me" yields.
+func DecideYield(me string, myCost float64, peer string, peerCost float64) bool {
+	if myCost != peerCost {
+		return myCost < peerCost
+	}
+	return me < peer
+}

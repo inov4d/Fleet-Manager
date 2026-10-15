@@ -708,6 +708,15 @@ export interface ColonyDecision {
   ok: boolean;
 }
 
+export interface ColonyNegotiation {
+  peer: string;
+  resource: string;
+  myCost: number;
+  peerCost: number;
+  iYield: boolean;
+  at: string;
+}
+
 export interface ColonyAgent {
   vehicleId: string;
   battery: number;
@@ -716,6 +725,20 @@ export interface ColonyAgent {
   claims: number;
   wins: number;
   decisions: ColonyDecision[];
+  yielded: number;
+  passed: number;
+  negotiations: ColonyNegotiation[];
+}
+
+export interface ColonyYield {
+  nonce: string;
+  vehicleId: string;
+  beneficiary: string;
+  resource: { type: string; id: string };
+  myCost: number;
+  peerCost: number;
+  reason: string;
+  at: string;
 }
 
 export interface ColonyGrant {
@@ -731,5 +754,5 @@ export interface ColonyStatus {
   mode: AllocationMode;
   tasks: ColonyTask[];
   agents: ColonyAgent[];
-  stats: { granted: number; rejected: number; recent: ColonyGrant[] };
+  stats: { granted: number; rejected: number; negotiated: number; recent: ColonyGrant[]; yields: ColonyYield[] };
 }

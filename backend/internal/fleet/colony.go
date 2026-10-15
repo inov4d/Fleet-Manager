@@ -238,6 +238,88 @@ func (a *arbiter) VehicleInfos(siteID string) []colony.VehicleInfo {
 	return out
 }
 
+// Conflicts reports, for every waiting vehicle, who holds what it waits for.
+func (a *arbiter) Conflicts(siteID string) []colony.Conflict {
+	c := a.core()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out []colony.Conflict
+	for id, v := range c.vehicles {
+		if v.SiteID != siteID {
+			continue
+		}
+		cf := colony.Conflict{VehicleID: id}
+		if ex := c.execs[id]; ex != nil {
+			if w := c.traffic.Waiting(id); w != nil && len(w.HeldBy) > 0 && !ex.waitingSince.IsZero() {
+				cf.Resource, cf.HeldBy, cf.Since, cf.Active = w.Resource, w.HeldBy, ex.waitingSince, true
+			}
+		}
+		out = append(out, cf)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].VehicleID < out[j].VehicleID })
+	return out
+}
+
+// Yield applies a concession negotiated between two agents: a working yielder
+// backs off / replans around the beneficiary, an idle yielder steps aside.
+// The traffic manager keeps enforcing the physical constraints.
+func (a *arbiter) Yield(siteID string, y colony.Yield) error {
+	c := a.core()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v := c.vehicles[y.VehicleID]
+	if v == nil || c.vehicles[y.Beneficiary] == nil {
+		return core.NotFound("vehicle", y.VehicleID)
+	}
+	r := c.rt[y.VehicleID]
+	// the deadlock (if any) between the two is resolved by the negotiation
+	for _, d := range c.traffic.Deadlocks(siteID) {
+		if d.ResolvedAt == nil && contains(d.VehicleIDs, y.VehicleID) && contains(d.VehicleIDs, y.Beneficiary) {
+			c.traffic.ResolveDeadlock(d.ID, "negotiated: "+v.Name+" gives way to "+c.vehicles[y.Beneficiary].Name)
+			delete(c.pendingDeadlocks, d.ID)
+			c.emit(core.Event{Kind: "deadlock.resolved", SiteID: siteID, VehicleID: y.VehicleID, Message: v.Name + " cède le passage (négociation locale)"})
+		}
+	}
+	if ex := c.execs[y.VehicleID]; ex != nil {
+		ex.yieldPeers = []string{y.Beneficiary}
+		ex.forcedAvoidNodes = appendUnique(ex.forcedAvoidNodes, nodesOf(y.Resource)...)
+		if bex := c.execs[y.Beneficiary]; bex != nil {
+			for i := bex.routeIdx; i < len(bex.route) && i < bex.routeIdx+3; i++ {
+				ex.forcedAvoidNodes = appendUnique(ex.forcedAvoidNodes, bex.route[i])
+			}
+		}
+		ex.negotiated = true
+		ex.replanRequested = true
+		ex.waitingSince = time.Time{}
+		_, _ = c.missions.Update(ex.missionID, func(mm *core.Mission) (string, error) {
+			mm.History = append(mm.History, core.MissionEvent{At: c.clock.Now(), Status: mm.Status, Message: fmt.Sprintf("yields to %s after local negotiation (%.1f vs %.1f)", y.Beneficiary, y.MyCost, y.PeerCost)})
+			return "mission.updated", nil
+		})
+		return nil
+	}
+	if c.pinnedVehicle(y.VehicleID) {
+		return core.Conflict("vehicle already has a pending task")
+	}
+	// idle yielder: step aside to a free node off the beneficiary's path
+	return c.stepAside(v, r, y.Beneficiary)
+}
+
+func contains(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func nodesOf(ref core.ResourceRef) []string {
+	if ref.Type == core.ResNode {
+		return []string{ref.ID}
+	}
+	return nil
+}
+
 // ColonyStatus is the API view of the colony mode.
 type ColonyStatus struct {
 	Mode   core.AllocationMode `json:"mode"`

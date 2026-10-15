@@ -50,6 +50,7 @@ type execution struct {
 	yieldIdx      int
 	yieldUntil    time.Time
 	yieldPeers    []string // other vehicles of the deadlock cycle
+	negotiated    bool     // the vehicle agreed locally to give way
 }
 
 // holdersMoving reports whether every holder of a denied resource is driving.
@@ -524,8 +525,10 @@ func (c *Core) stepExecution(vid string, now time.Time) {
 		switch {
 		case c.replanExecution(vid, m, cur):
 			ex.replanRequested = false
-		case ex.deadlockID != "" && c.backoff(vid, m, cur):
+			ex.negotiated = false
+		case (ex.deadlockID != "" || ex.negotiated) && c.backoff(vid, m, cur):
 			ex.replanRequested = false
+			ex.negotiated = false
 		case ex.deadlockID != "":
 			c.traffic.ResolveDeadlock(ex.deadlockID, "no alternative route; "+v.Name+" waits")
 			ex.deadlockID = ""
@@ -533,6 +536,7 @@ func (c *Core) stepExecution(vid string, now time.Time) {
 			ex.forcedAvoidNodes, ex.forcedAvoidEdges = nil, nil
 		default:
 			ex.replanRequested = false
+			ex.negotiated = false
 		}
 	}
 	// an order the vehicle did not take over (rejected or lost): re-base a new
@@ -778,7 +782,50 @@ func (c *Core) failExecution(vid string, m *core.Mission, reason string) {
 	c.endExecution(vid, true)
 }
 
+// pendingDeadlock is a deadlock left to the agents' local negotiation for a while.
+type pendingDeadlock struct {
+	res   traffic.Resolution
+	until time.Time
+}
+
 func (c *Core) handleDeadlock(res traffic.Resolution) {
+	v := c.vehicles[res.VehicleID]
+	if v == nil {
+		return
+	}
+	if c.dispatch.Mode == core.AllocationColony {
+		// let the neighbours negotiate first; the centre decides only if they fail
+		if c.pendingDeadlocks == nil {
+			c.pendingDeadlocks = map[string]pendingDeadlock{}
+		}
+		c.pendingDeadlocks[res.DeadlockID] = pendingDeadlock{res: res, until: c.clock.Now().Add(30 * time.Second)}
+		c.emit(core.Event{Kind: "deadlock.detected", SiteID: v.SiteID, VehicleID: res.VehicleID, Message: "interblocage détecté, négociation locale entre " + v.Name + " et ses voisins"})
+		return
+	}
+	c.centralDeadlock(res)
+}
+
+// expireNegotiations applies the central resolution to deadlocks the agents
+// did not settle in time.
+func (c *Core) expireNegotiations(now time.Time) {
+	for id, pd := range c.pendingDeadlocks {
+		if now.Before(pd.until) {
+			continue
+		}
+		delete(c.pendingDeadlocks, id)
+		unresolved := false
+		for _, d := range c.traffic.Deadlocks("") {
+			if d.ID == id && d.ResolvedAt == nil {
+				unresolved = true
+			}
+		}
+		if unresolved {
+			c.centralDeadlock(pd.res)
+		}
+	}
+}
+
+func (c *Core) centralDeadlock(res traffic.Resolution) {
 	ex := c.execs[res.VehicleID]
 	v := c.vehicles[res.VehicleID]
 	if v == nil {
@@ -1035,4 +1082,53 @@ func (c *Core) pinWith(missionID, vehicleID string, expl *core.AssignmentExplana
 		c.pins = map[string]pin{}
 	}
 	c.pins[missionID] = pin{vehicleID: vehicleID, explanation: expl, at: c.clock.Now()}
+}
+
+// stepAside sends an idle vehicle to the nearest free node off the
+// beneficiary's upcoming path (a short manual mission pinned to it).
+func (c *Core) stepAside(v *core.Vehicle, r *vehicleRuntime, beneficiary string) error {
+	g := c.graphs[v.SiteID]
+	if g == nil {
+		return core.Conflict("no active map")
+	}
+	cur := c.currentNode(v, r, g.g)
+	if cur == "" {
+		return core.Conflict("vehicle position unknown")
+	}
+	avoid := map[string]bool{cur: true}
+	for _, res := range c.traffic.Reservations(v.SiteID) {
+		if res.Resource.Type == core.ResNode && res.VehicleID != v.ID {
+			avoid[res.Resource.ID] = true
+		}
+	}
+	var avoidList []string
+	if bex := c.execs[beneficiary]; bex != nil {
+		for i := bex.routeIdx; i < len(bex.route) && i < bex.routeIdx+5; i++ {
+			avoid[bex.route[i]] = true
+			avoidList = append(avoidList, bex.route[i])
+		}
+	}
+	best, bestLen := "", math.Inf(1)
+	for _, n := range g.m.Nodes {
+		if avoid[n.ID] || (n.Type != core.NodeWaiting && n.Type != core.NodeParking && n.Type != core.NodeWaypoint) {
+			continue
+		}
+		rt, err := c.planner.Plan(planner.Request{Graph: g.g, From: cur, To: n.ID, Envelope: r.state.LoadEnvelope, AvoidNodes: avoidList, Congestion: c.traffic.Congestion(v.SiteID)})
+		if err != nil || len(rt.NodeIDs) > 4 {
+			continue
+		}
+		if rt.LengthM < bestLen {
+			bestLen, best = rt.LengthM, n.ID
+		}
+	}
+	if best == "" {
+		return core.Conflict("no free node to step aside to")
+	}
+	m, err := c.missions.Create(core.Mission{SiteID: v.SiteID, Type: core.MissionManual, Destination: best, Priority: 8, Source: core.SourceSystem,
+		Name: "Pas de côté " + v.Name + " → " + best + " (cède le passage à " + beneficiary + ")", CreatedBy: "negotiation"}, nil)
+	if err != nil {
+		return err
+	}
+	c.pinned(m.ID, v.ID)
+	return nil
 }
