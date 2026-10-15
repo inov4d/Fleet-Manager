@@ -1,0 +1,19 @@
+# Go
+backend/bin/
+backend/*.test
+backend/coverage.out
+# Node
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/*.tsbuildinfo
+frontend/next-env.d.ts
+# Data
+data/
+*.log
+.env
+.env.local
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
